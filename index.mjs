@@ -352,6 +352,16 @@ function checkedTarget(input, expected) {
   return actual.href
 }
 
+function checkedPollTarget(pollUrl, base) {
+  const actual = new URL(pollUrl)
+  const prefix = `${base}/vibe/sign-in/poll/`
+  const token = actual.pathname.slice(new URL(prefix).pathname.length)
+  if (!/^[A-Za-z0-9._~-]+$/.test(token) || actual.search) {
+    throw new Error("Unexpected Mistral request target")
+  }
+  return checkedTarget(actual, prefix + token)
+}
+
 function consoleHeaders(extra = {}) {
   return { accept: "application/json", "user-agent": UA(), ...extra }
 }
@@ -385,8 +395,9 @@ async function startSignIn(signal) {
   )
   if (!res.ok) throw new Error(`Mistral sign-in could not start (${res.status})${why(text)}`)
   if (!d?.process_id || !d?.sign_in_url || !d?.poll_url) throw new Error("Mistral sign-in answered an unexpected payload")
-  checkedTarget(d.poll_url, signInEndpoint(base, d.process_id, "poll"))
-  return { base, process_id: d.process_id, sign_in_url: d.sign_in_url, poll_url: d.poll_url, expires_at: d.expires_at, code_verifier }
+  checkedProcessId(d.process_id)
+  const poll_url = checkedPollTarget(d.poll_url, base)
+  return { base, process_id: d.process_id, sign_in_url: d.sign_in_url, poll_url, expires_at: d.expires_at, code_verifier }
 }
 
 function signInResponseError(status, message) {
@@ -395,14 +406,14 @@ function signInResponseError(status, message) {
   return error
 }
 
-function signInEndpoint(base, id, action) {
+function checkedProcessId(id) {
   if (typeof id !== "string" || !id || id === "." || id === ".." || /[^A-Za-z0-9._~-]/.test(id)) throw new Error("Invalid Mistral sign-in process ID")
-  return `${base}/vibe/sign-in/${encodeURIComponent(id)}/${action}`
+  return encodeURIComponent(id)
 }
 
-async function pollSignIn(pollUrl, processId, signal, base = consoleApi()) {
+async function pollSignIn(pollUrl, signal, base = consoleApi()) {
   const { res, data, text } = await readJSON(
-    checkedTarget(pollUrl, signInEndpoint(base, processId, "poll")),
+    checkedPollTarget(pollUrl, base),
     { redirect: "error", headers: consoleHeaders(), signal: withTimeout(signal, SIGN_IN_CALL_MS) },
     { retries: SIGN_IN_TRIES }
   )
@@ -416,7 +427,7 @@ async function exchangeSignIn(processId, exchangeToken, codeVerifier, signal, ba
   // retry here too: the server either hands out the key or has already
   // spent the token, and the second answer is the real one
   const { res, data: d, text } = await readJSON(
-    signInEndpoint(base, processId, "exchange"),
+    `${base}/vibe/sign-in/${checkedProcessId(processId)}/exchange`,
     {
       method: "POST",
       redirect: "error",
@@ -771,7 +782,7 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
               for (;;) {
                 let r
                 try {
-                  r = await pollSignIn(p.poll_url, p.process_id, s, p.base)
+                  r = await pollSignIn(p.poll_url, s, p.base)
                   misses = 0
                 } catch (e) {
                   if (s?.aborted) throw e

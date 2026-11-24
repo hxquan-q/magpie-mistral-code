@@ -74,11 +74,12 @@ function mockFetch() {
       return json({
         process_id: "p1",
         sign_in_url: "https://console.mistral.ai/login?process=p1",
-        poll_url: "http://mock.local/api/vibe/sign-in/p1/poll",
+        poll_url: "http://mock.local/api/vibe/sign-in/poll/token-p1",
         expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
       })
     }
-    if (u.pathname === "/api/vibe/sign-in/p1/poll") {
+    if (u.pathname === "/api/vibe/sign-in/poll/token-p1") {
+      expect(init.redirect).toBe("error")
       state.polls++
       return state.polls < 2 ? json({ status: "pending" }) : json({ status: "completed", exchange_token: "et-1" })
     }
@@ -179,8 +180,8 @@ test("sign-in reports denial and expiry", async () => {
   globalThis.fetch = async (input, init = {}) => {
     const u = new URL(String(input))
     const json = (v, status = 200) => new Response(JSON.stringify(v), { status, headers: { "content-type": "application/json" } })
-    if (u.pathname === "/api/vibe/sign-in") return json({ process_id: "p2", sign_in_url: "https://x/", poll_url: "http://mock.local/api/vibe/sign-in/p2/poll", expires_at: new Date(Date.now() + 60_000).toISOString() })
-    if (u.pathname.endsWith("/poll")) return json({ status: "denied", message: "nope" })
+    if (u.pathname === "/api/vibe/sign-in") return json({ process_id: "p2", sign_in_url: "https://x/", poll_url: "http://mock.local/api/vibe/sign-in/poll/token-p2", expires_at: new Date(Date.now() + 60_000).toISOString() })
+    if (u.pathname === "/api/vibe/sign-in/poll/token-p2") return json({ status: "denied", message: "nope" })
     return json({}, 404)
   }
   const started = await oauth.authorize()
@@ -801,7 +802,7 @@ test("a reset while the sign-in starts is retried, and the process is kept", asy
       JSON.stringify({
         process_id: "p9",
         sign_in_url: "https://console.mistral.ai/login?process=p9",
-        poll_url: "http://mock.local/api/vibe/sign-in/p9/poll",
+        poll_url: "http://mock.local/api/vibe/sign-in/poll/token-p9",
         expires_at: new Date(Date.now() + 600_000).toISOString(),
       }),
       { status: 200, headers: { "content-type": "application/json" } }
@@ -821,11 +822,11 @@ test("a reset while the sign-in polls or exchanges is retried", async () => {
     if (calls === 1) throw resetError()
     const u = new URL(String(input))
     const json = (v) => new Response(JSON.stringify(v), { status: 200, headers: { "content-type": "application/json" } })
-    if (u.pathname.endsWith("/poll")) return json({ status: "completed", exchange_token: "et-2" })
+    if (u.pathname === "/api/vibe/sign-in/poll/token-p9") return json({ status: "completed", exchange_token: "et-2" })
     if (u.pathname.endsWith("/exchange")) return json({ api_key: KEY })
     return json({})
   }
-  expect((await pollSignIn("http://mock.local/api/vibe/sign-in/p9/poll", "p9")).exchange_token).toBe("et-2")
+  expect((await pollSignIn("http://mock.local/api/vibe/sign-in/poll/token-p9")).exchange_token).toBe("et-2")
   calls = 0
   expect(await exchangeSignIn("p9", "et-2", "verifier")).toBe(KEY)
   expect(calls).toBe(2)
@@ -836,7 +837,7 @@ test("the sign-in's failures carry what the console said", async () => {
   globalThis.fetch = async () =>
     new Response(JSON.stringify({ detail: "Too many sign-in attempts" }), { status: 429, headers: { "content-type": "application/json" } })
   await expect(startSignIn()).rejects.toThrow(/429\): Too many sign-in attempts/)
-  const e = await pollSignIn("http://mock.local/api/vibe/sign-in/p9/poll", "p9").catch((x) => x)
+  const e = await pollSignIn("http://mock.local/api/vibe/sign-in/poll/token-p9").catch((x) => x)
   expect(e.transient).toBe(true)
   expect(String(e.message)).toContain("Too many sign-in attempts")
 })
@@ -844,7 +845,7 @@ test("the sign-in's failures carry what the console said", async () => {
 test("a poll refusal that is not a rate limit or a 5xx ends the sign-in", async () => {
   const { pollSignIn } = _internal
   globalThis.fetch = async () => new Response(JSON.stringify({ detail: "unknown process" }), { status: 404 })
-  const e = await pollSignIn("http://mock.local/api/vibe/sign-in/p9/poll", "p9").catch((x) => x)
+  const e = await pollSignIn("http://mock.local/api/vibe/sign-in/poll/token-p9").catch((x) => x)
   expect(e.transient).toBeUndefined()
   expect(String(e.message)).toContain("404: unknown process")
 })
@@ -862,10 +863,10 @@ test("the sign-in's poll loop rides out a rate limit and gives up on a refusal",
       return json({
         process_id: "p3",
         sign_in_url: "https://console.mistral.ai/login?process=p3",
-        poll_url: "http://mock.local/api/vibe/sign-in/p3/poll",
+        poll_url: "http://mock.local/api/vibe/sign-in/poll/token-p3",
         expires_at: new Date(Date.now() + 60_000).toISOString(),
       })
-    if (u.pathname.endsWith("/poll")) {
+    if (u.pathname === "/api/vibe/sign-in/poll/token-p3") {
       polls++
       if (polls === 1) return json({ detail: "slow down" }, 429)
       return json({ status: "completed", exchange_token: "et-3" })
@@ -888,7 +889,7 @@ test("the sign-in retries the exchange after a rate limit and a server error", a
   const bodies = []
   globalThis.fetch = async (input, init = {}) => {
     const path = new URL(String(input)).pathname
-    if (path.endsWith("/poll")) return Response.json({ status: "completed", exchange_token: "et-1" })
+    if (path === "/api/vibe/sign-in/poll/token-p1") return Response.json({ status: "completed", exchange_token: "et-1" })
     if (path.endsWith("/exchange")) {
       const status = statuses[bodies.length]
       bodies.push(init.body)
@@ -917,8 +918,8 @@ test("a dead socket at the very start is not reported as a sign-in failure", asy
     if (calls === 1) throw resetError()
     const u = new URL(String(input))
     const json = (v) => new Response(JSON.stringify(v), { status: 200, headers: { "content-type": "application/json" } })
-    if (u.pathname === "/api/vibe/sign-in") return json({ process_id: "p4", sign_in_url: "https://x/", poll_url: "http://mock.local/api/vibe/sign-in/p4/poll", expires_at: new Date(Date.now() + 60_000).toISOString() })
-    if (u.pathname.endsWith("/poll")) return json({ status: "completed", exchange_token: "et-4" })
+    if (u.pathname === "/api/vibe/sign-in") return json({ process_id: "p4", sign_in_url: "https://x/", poll_url: "http://mock.local/api/vibe/sign-in/poll/token-p4", expires_at: new Date(Date.now() + 60_000).toISOString() })
+    if (u.pathname === "/api/vibe/sign-in/poll/token-p4") return json({ status: "completed", exchange_token: "et-4" })
     if (u.pathname.endsWith("/exchange")) return json({ api_key: KEY })
     return json({})
   }
@@ -938,8 +939,8 @@ test("an authorize signal that ended with authorize does not cancel the callback
     const u = new URL(String(input))
     const json = (v) => new Response(JSON.stringify(v), { status: 200, headers: { "content-type": "application/json" } })
     if (u.pathname === "/api/vibe/sign-in")
-      return json({ process_id: "p5", sign_in_url: "https://x/", poll_url: "http://mock.local/api/vibe/sign-in/p5/poll", expires_at: new Date(Date.now() + 60_000).toISOString() })
-    if (u.pathname.endsWith("/poll")) return json({ status: "completed", exchange_token: "et-5" })
+      return json({ process_id: "p5", sign_in_url: "https://x/", poll_url: "http://mock.local/api/vibe/sign-in/poll/token-p5", expires_at: new Date(Date.now() + 60_000).toISOString() })
+    if (u.pathname === "/api/vibe/sign-in/poll/token-p5") return json({ status: "completed", exchange_token: "et-5" })
     if (u.pathname.endsWith("/exchange")) return json({ api_key: KEY })
     if (u.pathname === "/api/vibe/whoami") return json({ plan_name: "Vibe Pro", customer_id: "cust-5" })
     return json({}, 404)
@@ -960,7 +961,7 @@ test("a callback signal that aborts ends the wait", async () => {
     const u = new URL(String(input))
     const json = (v) => new Response(JSON.stringify(v), { status: 200, headers: { "content-type": "application/json" } })
     if (u.pathname === "/api/vibe/sign-in")
-      return json({ process_id: "p6", sign_in_url: "https://x/", poll_url: "http://mock.local/api/vibe/sign-in/p6/poll", expires_at: new Date(Date.now() + 60_000).toISOString() })
+      return json({ process_id: "p6", sign_in_url: "https://x/", poll_url: "http://mock.local/api/vibe/sign-in/poll/token-p6", expires_at: new Date(Date.now() + 60_000).toISOString() })
     return json({ status: "pending" })
   }
   const started = await oauth.authorize()
@@ -1004,10 +1005,17 @@ test("quota refreshes share only active reads", async () => {
   expect(calls).toBe(6)
 })
 
-test("polling rejects a different origin and a different process", async () => {
+test("polling only accepts the configured console's poll endpoint with one token", async () => {
   globalThis.fetch = async () => { throw new Error("unexpected fetch") }
-  for (const url of ["http://other.local/api/vibe/sign-in/p9/poll", "http://mock.local/api/vibe/sign-in/p8/poll"]) {
-    await expect(_internal.pollSignIn(url, "p9")).rejects.toThrow(/Unexpected Mistral request target/)
+  for (const url of [
+    "http://other.local/api/vibe/sign-in/poll/token-p9",
+    "http://mock.local/api/vibe/sign-in/p9/poll",
+    "http://mock.local/api/vibe/sign-in/poll/",
+    "http://mock.local/api/vibe/sign-in/poll/token-p9/extra",
+    "http://mock.local/api/vibe/sign-in/poll/token%2Fp9",
+    "http://mock.local/api/vibe/sign-in/poll/token-p9?extra=1",
+  ]) {
+    await expect(_internal.pollSignIn(url)).rejects.toThrow(/Unexpected Mistral request target/)
   }
 })
 
