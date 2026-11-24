@@ -29,6 +29,10 @@ magpie plugin login mistral-vibe oauth
 
 额度页的套餐来自 Mistral Console 对当前 Key 的身份查询。如果配置了多个账号，查看本次请求使用的账号卡片。
 
+![Magpie 额度页的 Mistral Pro 卡片，展示月度用量、重置时间和按量付费状态](assets/magpie-mistral-pro-quota.png)
+
+*Magpie 额度页的 Mistral Pro 卡片（示例数据）。*
+
 | 账号卡片显示 | 含义 |
 | --- | --- |
 | **Mistral Pro** | Mistral 已将该 Key 识别为个人 Pro 套餐。查看 **Monthly Vibe Code** 的用量和重置时间。 |
