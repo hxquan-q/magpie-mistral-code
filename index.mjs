@@ -547,8 +547,8 @@ function stripExtraFields(value, allowed) {
   return extras.length > 0
 }
 
-// asMistralMessage follows Mistral's UserMessage and TextChunk schemas and
-// puts thinking where Mistral takes it. A prefill (prefix) keeps its content.
+// asMistralMessage follows Mistral's user, assistant, and text chunk schemas.
+// Convert thinking before removing host fields. A prefill keeps its content.
 function asMistralMessage(m) {
   const c = m.content
   let changed = false
@@ -558,15 +558,19 @@ function asMistralMessage(m) {
     }
   }
   if (m.role === "user") return stripExtraFields(m, ["role", "content"]) || changed
-  if (!THINKING_FIELDS.some((f) => f in m)) return changed
-  const think = thinkingText(m)
-  for (const f of THINKING_FIELDS) delete m[f]
-  if (think === "" || m.role !== "assistant" || m.prefix === true) return true
-  const part = { type: "thinking", thinking: [{ type: "text", text: think }] }
-  if (typeof c === "string") m.content = c === "" ? [part] : [part, { type: "text", text: c }]
-  else if (Array.isArray(c)) m.content = [part, ...c]
-  else m.content = [part]
-  return true
+  if (THINKING_FIELDS.some((f) => f in m)) {
+    const think = thinkingText(m)
+    for (const f of THINKING_FIELDS) delete m[f]
+    changed = true
+    if (think !== "" && m.role === "assistant" && m.prefix !== true) {
+      const part = { type: "thinking", thinking: [{ type: "text", text: think }] }
+      if (typeof c === "string") m.content = c === "" ? [part] : [part, { type: "text", text: c }]
+      else if (Array.isArray(c)) m.content = [part, ...c]
+      else m.content = [part]
+    }
+  }
+  if (m.role === "assistant") return stripExtraFields(m, ["role", "content", "tool_calls", "prefix"]) || changed
+  return changed
 }
 
 // mistralBody is a chat request's body with every message's thinking in the

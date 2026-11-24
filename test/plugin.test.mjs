@@ -31,7 +31,9 @@ function mistralRefuse(body) {
   const known = ["role", "content", "tool_calls", "tool_call_id", "name", "prefix"]
   const detail = []
   for (const [i, m] of (q?.messages ?? []).entries()) {
-    const fields = m?.role === "user" ? ["role", "content"] : known
+    let fields = known
+    if (m?.role === "user") fields = ["role", "content"]
+    if (m?.role === "assistant") fields = ["role", "content", "tool_calls", "prefix"]
     for (const k of Object.keys(m ?? {})) {
       if (!fields.includes(k))
         detail.push({ type: "extra_forbidden", loc: ["body", "messages", i, m.role, k], msg: "Extra inputs are not permitted", input: m[k] })
@@ -727,28 +729,37 @@ test("the loader keeps only Mistral's fields on user messages", async () => {
   expect(JSON.parse(_internal.mistralBody(escaped)).messages).toEqual([system, user])
 })
 
-test("the loader strips extra fields from text parts in streaming history", async () => {
+test("the loader strips host metadata from assistant messages and text parts in streaming history", async () => {
   mockFetch()
   state.bodies = []
   const hooks = await plugin()
   const loader = await hooks.auth.loader(async () => ({ type: "api", key: KEY }))
   const text = { type: "text", text: "Hello.\n\n" }
   const thinking = { type: "thinking", thinking: [{ type: "text", text: "Think first." }] }
+  const assistant = { role: "assistant", content: [text, thinking] }
   const messages = [
     { role: "system", content: "Answer briefly." },
     { role: "user", content: "Say hello." },
-    { role: "assistant", content: [{ ...text, annotations: [], logprobs: [] }, thinking] },
+    {
+      ...assistant,
+      content: [{ ...text, annotations: [], logprobs: [] }, thinking],
+      conversationRequestId: "workbuddy-request",
+      messageId: "workbuddy-message",
+      name: "client-assistant",
+    },
     { role: "user", content: "Now say OK." },
   ]
   const body = JSON.stringify({ model: "deepseek-v4-1-flash-1017", stream: true, messages })
-  expect(mistralRefuse(body).map((issue) => issue.loc.at(-1))).toEqual(["annotations", "logprobs"])
+  expect(mistralRefuse(body).map((issue) => issue.loc.at(-1))).toEqual([
+    "conversationRequestId", "messageId", "name", "annotations", "logprobs",
+  ])
 
   const res = await loader.fetch("http://mock.local/v1/chat/completions", { method: "POST", body })
   expect(res.status).toBe(200)
   expect(state.bodies).toHaveLength(1)
   const out = JSON.parse(state.bodies[0])
   expect(out.stream).toBe(true)
-  expect(out.messages).toEqual(messages.with(2, { role: "assistant", content: [text, thinking] }))
+  expect(out.messages).toEqual(messages.with(2, assistant))
 })
 
 // and the loader does it on the way out, so a gateway that sends an earlier
