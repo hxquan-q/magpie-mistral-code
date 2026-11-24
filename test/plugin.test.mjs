@@ -687,6 +687,31 @@ test("a Request with an uncloneable body is not replayed", async () => {
   expect(calls).toBe(1)
 })
 
+test("the loader strips WorkBuddy metadata from user messages before sending", async () => {
+  mockFetch()
+  state.bodies = []
+  const hooks = await plugin()
+  const loader = await hooks.auth.loader(async () => ({ type: "api", key: KEY }))
+  const system = { role: "system", content: "Answer briefly." }
+  const user = { role: "user", content: [{ type: "text", text: "Say OK." }] }
+  const body = JSON.stringify({
+    model: "deepseek-v4-1-flash-1017",
+    messages: [system, { ...user, agent: "cli", conversationRequestId: "workbuddy-request" }],
+  })
+  expect(mistralRefuse(body).map((issue) => issue.loc)).toEqual([
+    ["body", "messages", 1, "user", "agent"],
+    ["body", "messages", 1, "user", "conversationRequestId"],
+  ])
+  const res = await loader.fetch("http://mock.local/v1/chat/completions", { method: "POST", body })
+  expect(res.status).toBe(200)
+  expect(state.bodies).toHaveLength(1)
+  expect(JSON.parse(state.bodies[0]).messages).toEqual([system, user])
+
+  const escaped = body.replace('"agent"', String.raw`"\u0061gent"`).replace('"conversationRequestId"', String.raw`"\u0063onversationRequestId"`)
+  expect(JSON.parse(escaped)).toEqual(JSON.parse(body))
+  expect(JSON.parse(_internal.mistralBody(escaped)).messages).toEqual([system, user])
+})
+
 // and the loader does it on the way out, so a gateway that sends an earlier
 // turn's thinking as reasoning_content reaches Mistral with the part instead
 test("the loader puts an earlier turn's thinking in the typed part", async () => {

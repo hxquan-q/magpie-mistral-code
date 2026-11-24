@@ -541,12 +541,17 @@ function thinkingText(m) {
   return out
 }
 
-// asMistralMessage puts one message's thinking where Mistral takes it and
-// says whether it changed anything. A message with no thinking of its own
-// keeps its bytes. A prefill (prefix) keeps its content as it is: its text
-// is what goes on, so the thinking is only dropped there.
+// asMistralMessage drops unsupported WorkBuddy user metadata and puts
+// thinking where Mistral takes it. A prefill (prefix) keeps its content:
+// its text is what goes on, so the thinking is only dropped there.
 function asMistralMessage(m) {
-  if (!THINKING_FIELDS.some((f) => f in m)) return false
+  let changed = false
+  if (m.role === "user" && ("agent" in m || "conversationRequestId" in m)) {
+    delete m.agent
+    delete m.conversationRequestId
+    changed = true
+  }
+  if (!THINKING_FIELDS.some((f) => f in m)) return changed
   const think = thinkingText(m)
   for (const f of THINKING_FIELDS) delete m[f]
   if (think === "" || m.role !== "assistant" || m.prefix === true) return true
@@ -563,7 +568,7 @@ function asMistralMessage(m) {
 // such field comes back as it was, byte for byte, and so does one that isn't
 // a chat request's JSON.
 function mistralBody(body) {
-  if (typeof body !== "string" || !body.includes("reasoning")) return body
+  if (typeof body !== "string") return body
   let q
   try {
     q = JSON.parse(body)
