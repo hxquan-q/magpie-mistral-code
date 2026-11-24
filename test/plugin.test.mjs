@@ -31,8 +31,9 @@ function mistralRefuse(body) {
   const known = ["role", "content", "tool_calls", "tool_call_id", "name", "prefix"]
   const detail = []
   for (const [i, m] of (q?.messages ?? []).entries()) {
+    const fields = m?.role === "user" ? ["role", "content"] : known
     for (const k of Object.keys(m ?? {})) {
-      if (!known.includes(k))
+      if (!fields.includes(k))
         detail.push({ type: "extra_forbidden", loc: ["body", "messages", i, m.role, k], msg: "Extra inputs are not permitted", input: m[k] })
     }
     const parts = Array.isArray(m?.content) ? m.content : []
@@ -687,7 +688,7 @@ test("a Request with an uncloneable body is not replayed", async () => {
   expect(calls).toBe(1)
 })
 
-test("the loader strips WorkBuddy metadata from user messages before sending", async () => {
+test("the loader keeps only Mistral's fields on user messages", async () => {
   mockFetch()
   state.bodies = []
   const hooks = await plugin()
@@ -696,11 +697,19 @@ test("the loader strips WorkBuddy metadata from user messages before sending", a
   const user = { role: "user", content: [{ type: "text", text: "Say OK." }] }
   const body = JSON.stringify({
     model: "deepseek-v4-1-flash-1017",
-    messages: [system, { ...user, agent: "cli", conversationRequestId: "workbuddy-request" }],
+    messages: [system, {
+      ...user,
+      agent: "cli",
+      conversationRequestId: "workbuddy-request",
+      startsNewUserRequest: true,
+      name: "client-user",
+    }],
   })
   expect(mistralRefuse(body).map((issue) => issue.loc)).toEqual([
     ["body", "messages", 1, "user", "agent"],
     ["body", "messages", 1, "user", "conversationRequestId"],
+    ["body", "messages", 1, "user", "startsNewUserRequest"],
+    ["body", "messages", 1, "user", "name"],
   ])
   const res = await loader.fetch("http://mock.local/v1/chat/completions", { method: "POST", body })
   expect(res.status).toBe(200)

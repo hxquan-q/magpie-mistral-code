@@ -541,17 +541,16 @@ function thinkingText(m) {
   return out
 }
 
-// asMistralMessage drops unsupported WorkBuddy user metadata and puts
-// thinking where Mistral takes it. A prefill (prefix) keeps its content:
+// asMistralMessage follows Mistral's UserMessage schema and puts thinking
+// where Mistral takes it. A prefill (prefix) keeps its content:
 // its text is what goes on, so the thinking is only dropped there.
 function asMistralMessage(m) {
-  let changed = false
-  if (m.role === "user" && ("agent" in m || "conversationRequestId" in m)) {
-    delete m.agent
-    delete m.conversationRequestId
-    changed = true
+  if (m.role === "user") {
+    const extras = Object.keys(m).filter((field) => field !== "role" && field !== "content")
+    for (const field of extras) delete m[field]
+    return extras.length > 0
   }
-  if (!THINKING_FIELDS.some((f) => f in m)) return changed
+  if (!THINKING_FIELDS.some((f) => f in m)) return false
   const think = thinkingText(m)
   for (const f of THINKING_FIELDS) delete m[f]
   if (think === "" || m.role !== "assistant" || m.prefix === true) return true
