@@ -338,6 +338,21 @@ async function whoami(key) {
   return res.ok ? data : null
 }
 
+function accountIdentity(who) {
+  const kind = typeof who?.plan_type === "string" ? who.plan_type.trim().toLowerCase() : ""
+  const name = typeof who?.plan_name === "string" ? who.plan_name.trim() : ""
+  if (kind === "api") return { kind, plan: "Mistral Studio API" }
+  if (kind === "chat" && name) {
+    const plans = { INDIVIDUAL: "Mistral Pro", FREE: "Mistral Free", EDU: "Mistral Student", TEAM: "Mistral Team" }
+    return { kind, plan: plans[name.toUpperCase()] ?? name }
+  }
+  if (kind === "mistral_code" && name) {
+    const plans = { F: "Free Codestral", E: "Code Enterprise" }
+    return { kind, plan: plans[name.toUpperCase()] ?? name }
+  }
+  return { kind }
+}
+
 // ---- models: /v1/models, limits filled from models.dev when it knows them ----
 
 let devModels = null
@@ -445,39 +460,53 @@ async function readUsage(key) {
     const { res, data } = await readJSON(url, { headers, signal: AbortSignal.timeout(8000) })
     return res.ok ? data : null
   }
-  const [subscription, budget, who] = await Promise.all([
+  const [subscription, budget, who] = (await Promise.allSettled([
     ask(`${apiBase()}/billing/subscription`),
     ask(`${apiBase()}/billing/budget`),
     whoami(key),
-  ])
-  const plan = subscription?.plan_name || who?.plan_name || undefined
+  ])).map((read) => read.status === "fulfilled" ? read.value : null)
+  const identity = accountIdentity(who)
   const vb = budget?.vibe_budget
   const ab = budget?.api_budget
-  const usd = (x) => Math.round(x * 1e6) / 1e6
   const windows = []
+  const statusWindow = (name, display) => ({ name, display, aside: true })
   const windowOf = (name, w, aside) => {
-    if (!w || typeof w.usage_percentage !== "number") return null
-    const initial = typeof w.initial_budget === "number" ? w.initial_budget : 0
+    if (!Number.isFinite(w?.usage_percentage) || w.usage_percentage < 0 || w.initial_budget === 0) return null
     const resetsAt = w.reset_at ? Date.parse(w.reset_at) : NaN
     const span = Number.isFinite(resetsAt) ? Math.max(3600, Math.floor((resetsAt - Date.now()) / 1000)) : 30 * 86400
-    const usedUsd = usd(initial * w.usage_percentage / 100)
     const out = {
       name,
       used: w.usage_percentage,
-      amount: usedUsd,
-      limit: initial,
-      unit: "USD",
       resetsAt: Number.isFinite(resetsAt) ? resetsAt : undefined,
       span,
+    }
+    if (Number.isFinite(w.initial_budget) && w.initial_budget > 0) {
+      out.amount = Math.round(w.initial_budget * (w.usage_percentage / 100) * 1e6) / 1e6
+      out.limit = w.initial_budget
+      if (typeof w.currency === "string") out.unit = w.currency.trim().toUpperCase()
     }
     if (aside) out.aside = true
     return out
   }
-  const vbm = windowOf("Monthly Vibe Code", vb, false)
-  if (vbm) windows.push(vbm)
+
+  if (identity.kind === "api") {
+    windows.push(statusWindow("Vibe Code account", "Studio API key. Create a Vibe CLI key under Code > Vibe CLI."))
+  } else {
+    const name = "Monthly Vibe Code"
+    // The organization budget can be readable with a Studio key as well.
+    const monthly = windowOf(name, vb, identity.kind !== "chat")
+    windows.push(monthly ?? statusWindow(name, vb?.initial_budget === 0 ? "No monthly budget" : "Budget unavailable"))
+    const payg = [vb?.payg_enabled, subscription?.vibe_payg_enabled].find((value) => typeof value === "boolean")
+    windows.push(statusWindow("Pay as you go", payg === undefined ? "Unknown" : payg ? "On" : "Off"))
+    if (!identity.plan) {
+      const billingPlan = typeof subscription?.plan_name === "string" && subscription.plan_name.trim()
+      const display = billingPlan ? `Plan not confirmed · Billing reports ${billingPlan}` : "Plan not confirmed"
+      windows.push(statusWindow("Vibe Code account", display))
+    }
+  }
   const abm = windowOf("Platform API credits", ab, true)
   if (abm) windows.push(abm)
-  return { plan, windows, payg: subscription?.vibe_payg_enabled ?? vb?.payg_enabled ?? undefined }
+  return identity.plan ? { plan: identity.plan, windows } : { windows, signIn: "kept" }
 }
 
 // ---- an earlier turn's thinking, in the shape Mistral takes it ----
@@ -564,12 +593,7 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
     usage: async (getAuth) => {
       const key = keyOf(await getAuth())
       if (!key) return { error: "Not signed in", windows: [] }
-      try {
-        const u = await readUsage(key)
-        return { plan: u.plan, windows: u.windows }
-      } catch (e) {
-        return { error: `Mistral billing read failed: ${e?.message ?? e}`, windows: [] }
-      }
+      return readUsage(key)
     },
     loader: async (getAuth) => {
       const auth = await getAuth()
@@ -635,7 +659,7 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
                     try {
                       const key = await exchangeSignIn(p.process_id, r.exchange_token, p.code_verifier, s)
                       const who = await whoami(key).catch(() => null)
-                      const out = { type: "success", key, metadata: { plan: who?.plan_name, vibeEntitlement: who?.has_paid_vibe_entitlement } }
+                      const out = { type: "success", key, metadata: { plan: accountIdentity(who).plan, vibeEntitlement: who?.has_paid_vibe_entitlement } }
                       if (who?.customer_id != null) out.accountId = String(who.customer_id)
                       return out
                     } catch (e) {
@@ -657,7 +681,7 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
       {
         type: "api",
         label: "Vibe Code API key",
-        placeholder: "key made in console.mistral.ai under Code > Vibe Code CLI",
+        placeholder: "key made in console.mistral.ai under Code > Vibe CLI",
       },
     ],
   },

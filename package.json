@@ -1,7 +1,7 @@
 {
   "name": "@solary/magpie-mistral-vibe",
   "version": "0.2.0",
-  "description": "Mistral Vibe Code subscription as an OpenCode/magpie provider plugin (unofficial fork): browser sign-in mints an API key that bills the plan's monthly Vibe Code budget on api.mistral.ai; shows plan and quota in USD",
+  "description": "Mistral Vibe Code subscription as an OpenCode/magpie provider plugin (unofficial fork), with browser sign-in or a Vibe CLI key and plan, quota, and pay-as-you-go status in Magpie",
   "type": "module",
   "main": "./opencode.mjs",
   "exports": {

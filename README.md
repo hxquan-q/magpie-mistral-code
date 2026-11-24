@@ -1,6 +1,6 @@
 # Mistral Vibe Code for magpie / OpenCode
 
-> 把你的 **Mistral Vibe Code 订阅**接进 [magpie](https://github.com/yetone/magpie) 与 OpenCode，让 Claude Code、Codex、OpenCode 等 agent 直接消耗订阅的**月度 Vibe 预算**，而不是按 API 列表价烧平台额度。
+> 把你的 **Mistral Vibe Code 订阅**接进 [magpie](https://github.com/yetone/magpie) 与 OpenCode，让 Claude Code、Codex、OpenCode 等 agent 使用套餐内的月度 Vibe Code 额度。
 
 非官方插件，与 Mistral AI 无隶属关系。Provider id：`mistral-vibe`。
 
@@ -8,21 +8,7 @@
 
 ## 为什么需要它
 
-同一个 Mistral 账号下有两本账，**用哪一本取决于 key 的出身，不取决于模型**：
-
-| key 的来源 | `whoami` 身份 | 调用 `api.mistral.ai/v1` 扣哪本账 |
-| --- | --- | --- |
-| **本插件浏览器登录铸出**（官方 CLI 同款流程） | `CHAT / INDIVIDUAL` | ✅ 套餐的 **Monthly Vibe Code 预算** |
-| 在 console 的 `api-keys` 页面手工创建 | `API / FREE` | ❌ La Plateforme 的 **API 额度**（按列表价） |
-
-实测对照（同账号、同模型 `deepseek-v4-1-flash-1017`、同一条 `Reply with exactly: OK`）：
-
-```
-浏览器铸出的 key ：vibe 0.0000150% → 0.0000167%     api 不变
-console 创建的 key：vibe 不变                        api 0.017989% → 0.018139%
-```
-
-所以本插件做的事只有一件：**复刻官方 CLI 的浏览器登录流程**（`POST console.mistral.ai/api/vibe/sign-in` → PKCE → 轮询 → `POST /api/vibe/sign-in/{id}/exchange`，响应体直接是 `api_key`），拿到绑定订阅身份的 key，再把 agent 的请求转发到 `https://api.mistral.ai/v1`。
+Vibe Code 会先使用套餐包含的月度额度。每个组织的额度和超额付费设置由 Mistral 管理，实际扣账可在 Mistral 的用量页面核对。 [Mistral 订阅说明](https://docs.mistral.ai/admin/billing-usage/subscriptions)
 
 ## 安装
 
@@ -33,30 +19,18 @@ magpie plugin login mistral-vibe          # 浏览器登录；窗口别关，链
 
 装完在 agent 里挑 `mistral-vibe/<模型>` 即可。
 
-## 登录：只走浏览器
+## 登录与套餐确认
 
-- `magpie plugin login mistral-vibe`（或 GUI 里「添加账号」）→ 生成 `console.mistral.ai/codestral/cli/authenticate?...` 链接
-- 链接 **10 分钟有效**；登录完成后 magpie 自动交换出 key，无需其他操作
-- ⚠️ **不要**改成粘贴 console `api-keys` 页面的平台 key —— 那会把用量记到 API 额度上（见上表）
+- **浏览器登录。** 在 Magpie 添加账号时选 `Sign in with Mistral (browser)`。打开链接后，用你的 Mistral 订阅账号登录。链接有效期为 10 分钟。
+- **手动输入 Vibe CLI Key。** 到 Mistral 控制台的 `Code > Vibe CLI` 创建 Key，再在 Magpie 选 `Vibe Code API key` 粘贴。 [Vibe CLI 登录与 Key](https://docs.mistral.ai/vibe/code/cli/api-keys-profiles)
 
-登录后可核对身份：
-
-```powershell
-curl -H "Authorization: Bearer <key>" https://console.mistral.ai/api/vibe/whoami
-# 期望 plan_type=CHAT, plan_name=INDIVIDUAL
-```
+在 Magpie 的额度页刷新后，`whoami` 确认为 `CHAT / INDIVIDUAL` 的账号会显示 **Mistral Pro**。识别到 Studio API Key 时，额度卡会提示到哪里创建 Vibe CLI Key。显示 `Plan not confirmed` 时，可稍后刷新核对。
 
 ## 额度展示
 
-provider 行展示套餐与两本账，单位美元：
+额度卡以 Mistral 返回的额度和重置时间为准。在 Magpie 的额度页可以切换已用和剩余显示。`Pay as you go` 显示 Mistral 的超额付费设置。Magpie 依据已确认账号的月度额度做路由限额判定。只想用套餐内额度时，可以到 Mistral 订阅页确认 PAYG 已关闭。
 
-```
-Monthly Vibe Code       0.00005 / 300 USD   ↻ Dec 1
-Platform API credits    0.005487 / 30 USD   ↻ Dec 1
-plan: INDIVIDUAL
-```
-
-`Platform API credits` 是 `aside` 只读窗口：只展示，不参与 magpie 的路由限额判定。
+`Budget unavailable` 表示本次未拿到可用的额度读数。`No monthly budget` 表示 Mistral 返回的月度额度为零。已有额度用完时会显示已用 100% 或剩余 0%，重置时间可用于确认何时恢复。身份未确认时，组织额度作为参考显示。有独立平台额度时，`Platform API credits` 也可供参考。
 
 命令行核对：
 
@@ -97,8 +71,8 @@ agent 回传历史时会带 `reasoning_content` / `reasoning` / `reasoning_detai
 | `sign-in could not start (429)` | 登录发起端点有频率限制，停 15–30 分钟后**只试一次**，不要连点 |
 | `ECONNRESET: The socket connection was closed unexpectedly` | 连接池里的旧 keep-alive 套接字被 Cloudflare 关掉了。插件已自动换连接重试（发起/轮询/交换各 3 次，轮询与交换在链接 10 分钟有效期内对 429、5xx、断网继续退避重试），无需手动处理；若仍出现，重跑 `magpie plugin login mistral-vibe` 即可 |
 | `context deadline exceeded` / poll 429 | 链接 10 分钟内没点，重新 `magpie plugin login mistral-vibe` |
-| 界面显示「暂无额度数据」 | GUI 缓存，重开设置页或重启 magpie 窗口 |
-| 扣的是 API 额度 | 用的是 console 平台 key，删掉该账号后用浏览器登录重铸 |
+| `Budget unavailable` | 刷新额度页，或到 Mistral 用量页确认组织额度 |
+| `Studio API key` | 用浏览器重新登录，或换成在 `Code > Vibe CLI` 创建的 Key |
 | 模型列表为空 | 未登录成功；先 `magpie plugin list --json` 看 `signedIn` |
 
 ## 关于风控
@@ -111,7 +85,7 @@ agent 回传历史时会带 `reasoning_content` / `reasoning` / `reasoning_detai
 
 ## 致谢
 
-上游：[songlairui/magpie-mistral-code](https://github.com/songlairui/magpie-mistral-code)。本 fork 的改动：额度按美元展示、出站 UA 对齐官方客户端、传输层对失效 keep-alive 套接字自动重试（登录不再因 `ECONNRESET` 中断）。
+本 fork 增加了套餐身份确认、额度与 PAYG 状态展示、客户端 UA 对齐，以及失效 keep-alive 连接的重试。 [上游仓库](https://github.com/songlairui/magpie-mistral-code)
 
 ## License
 

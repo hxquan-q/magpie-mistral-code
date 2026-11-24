@@ -82,7 +82,7 @@ function mockFetch() {
     if (u.pathname === "/api/vibe/whoami") {
       state.whoamis++
       if (h.get("authorization") !== `Bearer ${KEY}`) return json({ error: "unauthorized" }, 401)
-      return json({ plan_name: "Vibe Pro", plan_type: "pro", has_paid_vibe_entitlement: true, customer_id: "cust-1" })
+      return json({ plan_name: "INDIVIDUAL", plan_type: "CHAT", has_paid_vibe_entitlement: true, customer_id: "cust-1" })
     }
     if (u.pathname === "/v1/chat/completions" && init.method === "POST") {
       state.chats.push(h.get("authorization"))
@@ -119,9 +119,9 @@ function mockFetch() {
       })
     }
     if (u.pathname === "/v1/billing/subscription")
-      return json({ plan_name: "Vibe Pro", vibe_payg_enabled: true })
+      return json({ plan_name: "INDIVIDUAL", vibe_payg_enabled: true })
     if (u.pathname === "/v1/billing/budget")
-      return json({ vibe_budget: { usage_percentage: 42.5, initial_budget: 100, reset_at: "2099-01-01T00:00:00Z", payg_enabled: true } })
+      return json({ vibe_budget: { usage_percentage: 42.5, initial_budget: 100, currency: "EUR", reset_at: "2099-01-01T00:00:00Z", payg_enabled: true } })
     return json({ error: `unexpected ${init.method ?? "GET"} ${u.pathname}` }, 404)
   }
 }
@@ -157,6 +157,7 @@ test("browser sign-in: start, poll to completed, exchange for a Vibe-budget key"
   expect(result.type).toBe("success")
   expect(result.key).toBe(KEY)
   expect(result.accountId).toBe("cust-1")
+  expect(result.metadata).toEqual({ plan: "Mistral Pro", vibeEntitlement: true })
   expect(state.exchanges).toHaveLength(1)
   expect(state.exchanges[0].exchange_token).toBe("et-1")
   expect(typeof state.exchanges[0].code_verifier).toBe("string")
@@ -196,15 +197,104 @@ test("loader with no sign-in returns no options", async () => {
   expect(await hooks.auth.loader(async () => null)).toEqual({})
 })
 
-test("usage reads the monthly Vibe Code budget and the plan", async () => {
+test("usage confirms a pasted Vibe key and reports its budget and PAYG", async () => {
   mockFetch()
   const hooks = await plugin()
   const u = await hooks.auth.usage(async () => ({ type: "api", key: KEY }))
-  expect(u.plan).toBe("Vibe Pro")
-  expect(u.windows).toHaveLength(1)
-  expect(u.windows[0].used).toBe(42.5)
-  expect(u.windows[0].resetsAt).toBe(Date.parse("2099-01-01T00:00:00Z"))
+  expect(u.plan).toBe("Mistral Pro")
+  expect(u.windows[0]).toMatchObject({ used: 42.5, amount: 42.5, limit: 100, unit: "EUR", resetsAt: Date.parse("2099-01-01T00:00:00Z") })
   expect(u.windows[0].span).toBeGreaterThan(3600)
+  expect(u.windows[1]).toEqual({ name: "Pay as you go", display: "On", aside: true })
+})
+
+test("usage identifies a pasted Studio key without presenting Vibe allowance as its own", async () => {
+  globalThis.fetch = async (input) => {
+    const path = new URL(String(input)).pathname
+    if (path === "/api/vibe/whoami") return Response.json({ plan_type: "API", plan_name: "FREE" })
+    if (path === "/v1/billing/subscription") return Response.json({ plan_name: "INDIVIDUAL", vibe_payg_enabled: true })
+    return Response.json({
+      vibe_budget: { usage_percentage: 42.5, initial_budget: 100 },
+      api_budget: { usage_percentage: 10, initial_budget: 50, currency: "EUR" },
+    })
+  }
+  const hooks = await plugin()
+  const u = await hooks.auth.usage(async () => ({ type: "api", key: "studio-key" }))
+  expect(u.plan).toBe("Mistral Studio API")
+  expect(u.windows).toEqual([
+    { name: "Vibe Code account", display: "Studio API key. Create a Vibe CLI key under Code > Vibe CLI.", aside: true },
+    { name: "Platform API credits", used: 10, amount: 5, limit: 50, unit: "EUR", aside: true, resetsAt: undefined, span: 30 * 86400 },
+  ])
+})
+
+test("a failed billing read preserves the Pro identity and reports missing allowance separately", async () => {
+  mockFetch()
+  const fetchMock = globalThis.fetch
+  globalThis.fetch = async (input, init) => {
+    if (new URL(String(input)).pathname === "/v1/billing/budget") throw new Error("budget request timed out")
+    return fetchMock(input, init)
+  }
+  const hooks = await plugin()
+  const u = await hooks.auth.usage(async () => ({ type: "api", key: KEY }))
+  expect(u.plan).toBe("Mistral Pro")
+  expect(u.windows).toEqual([
+    { name: "Monthly Vibe Code", display: "Budget unavailable", aside: true },
+    { name: "Pay as you go", display: "On", aside: true },
+  ])
+})
+
+test("exhausted allowance stays a numeric reading when identity and subscription reads fail", async () => {
+  globalThis.fetch = async (input) => {
+    const path = new URL(String(input)).pathname
+    if (path === "/api/vibe/whoami") return Response.json({}, { status: 503 })
+    if (path === "/v1/billing/subscription") throw new Error("subscription request timed out")
+    return Response.json({ vibe_budget: { usage_percentage: 100, initial_budget: 100, payg_enabled: false } })
+  }
+  const hooks = await plugin()
+  const u = await hooks.auth.usage(async () => ({ type: "api", key: KEY }))
+  expect(u.plan).toBeUndefined()
+  expect(u.signIn).toBe("kept")
+  expect(u.windows[0]).toMatchObject({ name: "Monthly Vibe Code", used: 100, amount: 100, limit: 100, aside: true })
+  expect(u.windows[1]).toEqual({ name: "Pay as you go", display: "Off", aside: true })
+  expect(u.windows[2]).toEqual({ name: "Vibe Code account", display: "Plan not confirmed", aside: true })
+})
+
+test("missing PAYG and amount stay unknown when Mistral reports only a usage percentage", async () => {
+  mockFetch()
+  const fetchMock = globalThis.fetch
+  globalThis.fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname
+    if (path === "/v1/billing/subscription") return Response.json({ plan_name: "INDIVIDUAL" })
+    if (path === "/v1/billing/budget") return Response.json({ vibe_budget: { usage_percentage: 25, reset_at: "2099-01-01T00:00:00Z" } })
+    return fetchMock(input, init)
+  }
+  const hooks = await plugin()
+  const u = await hooks.auth.usage(async () => ({ type: "api", key: KEY }))
+  expect(u.windows[0]).toMatchObject({ used: 25, resetsAt: Date.parse("2099-01-01T00:00:00Z") })
+  expect(u.windows[0].limit).toBeUndefined()
+  expect(u.windows[1]).toEqual({ name: "Pay as you go", display: "Unknown", aside: true })
+})
+
+test("a zero allocation is distinct from an unavailable or exhausted budget", async () => {
+  mockFetch()
+  const fetchMock = globalThis.fetch
+  globalThis.fetch = async (input, init) => {
+    if (new URL(String(input)).pathname === "/v1/billing/budget")
+      return Response.json({ vibe_budget: { usage_percentage: 0, initial_budget: 0 } })
+    return fetchMock(input, init)
+  }
+  const hooks = await plugin()
+  const u = await hooks.auth.usage(async () => ({ type: "api", key: KEY }))
+  expect(u.windows[0]).toEqual({ name: "Monthly Vibe Code", display: "No monthly budget", aside: true })
+})
+
+test("a billing plan alone does not confirm the pasted key's account", async () => {
+  mockFetch()
+  const hooks = await plugin()
+  const u = await hooks.auth.usage(async () => ({ type: "api", key: "unverified-key" }))
+  expect(u.plan).toBeUndefined()
+  expect(u.signIn).toBe("kept")
+  expect(u.windows[0]).toMatchObject({ name: "Monthly Vibe Code", used: 42.5, aside: true })
+  expect(u.windows[2]).toEqual({ name: "Vibe Code account", display: "Plan not confirmed · Billing reports INDIVIDUAL", aside: true })
 })
 
 test("usage without a sign-in says so", async () => {
