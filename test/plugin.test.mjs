@@ -38,6 +38,12 @@ function mistralRefuse(body) {
     }
     const parts = Array.isArray(m?.content) ? m.content : []
     for (const [j, p] of parts.entries()) {
+      if (p?.type === "text") {
+        for (const k of Object.keys(p)) {
+          if (k !== "type" && k !== "text")
+            detail.push({ type: "extra_forbidden", loc: ["body", "messages", i, m.role, "content", j, "text", k] })
+        }
+      }
       if (p?.type !== "thinking") continue
       const chunks = p.thinking
       const ok = Array.isArray(chunks) && chunks.every((c) => c?.type === "text" && typeof c.text === "string")
@@ -719,6 +725,30 @@ test("the loader keeps only Mistral's fields on user messages", async () => {
   const escaped = body.replace('"agent"', String.raw`"\u0061gent"`).replace('"conversationRequestId"', String.raw`"\u0063onversationRequestId"`)
   expect(JSON.parse(escaped)).toEqual(JSON.parse(body))
   expect(JSON.parse(_internal.mistralBody(escaped)).messages).toEqual([system, user])
+})
+
+test("the loader strips extra fields from text parts in streaming history", async () => {
+  mockFetch()
+  state.bodies = []
+  const hooks = await plugin()
+  const loader = await hooks.auth.loader(async () => ({ type: "api", key: KEY }))
+  const text = { type: "text", text: "Hello.\n\n" }
+  const thinking = { type: "thinking", thinking: [{ type: "text", text: "Think first." }] }
+  const messages = [
+    { role: "system", content: "Answer briefly." },
+    { role: "user", content: "Say hello." },
+    { role: "assistant", content: [{ ...text, annotations: [], logprobs: [] }, thinking] },
+    { role: "user", content: "Now say OK." },
+  ]
+  const body = JSON.stringify({ model: "deepseek-v4-1-flash-1017", stream: true, messages })
+  expect(mistralRefuse(body).map((issue) => issue.loc.at(-1))).toEqual(["annotations", "logprobs"])
+
+  const res = await loader.fetch("http://mock.local/v1/chat/completions", { method: "POST", body })
+  expect(res.status).toBe(200)
+  expect(state.bodies).toHaveLength(1)
+  const out = JSON.parse(state.bodies[0])
+  expect(out.stream).toBe(true)
+  expect(out.messages).toEqual(messages.with(2, { role: "assistant", content: [text, thinking] }))
 })
 
 // and the loader does it on the way out, so a gateway that sends an earlier

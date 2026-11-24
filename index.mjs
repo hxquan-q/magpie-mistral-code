@@ -541,21 +541,28 @@ function thinkingText(m) {
   return out
 }
 
-// asMistralMessage follows Mistral's UserMessage schema and puts thinking
-// where Mistral takes it. A prefill (prefix) keeps its content:
-// its text is what goes on, so the thinking is only dropped there.
+function stripExtraFields(value, allowed) {
+  const extras = Object.keys(value).filter((field) => !allowed.includes(field))
+  for (const field of extras) delete value[field]
+  return extras.length > 0
+}
+
+// asMistralMessage follows Mistral's UserMessage and TextChunk schemas and
+// puts thinking where Mistral takes it. A prefill (prefix) keeps its content.
 function asMistralMessage(m) {
-  if (m.role === "user") {
-    const extras = Object.keys(m).filter((field) => field !== "role" && field !== "content")
-    for (const field of extras) delete m[field]
-    return extras.length > 0
+  const c = m.content
+  let changed = false
+  if (Array.isArray(c)) {
+    for (const part of c) {
+      if (part?.type === "text" && stripExtraFields(part, ["type", "text"])) changed = true
+    }
   }
-  if (!THINKING_FIELDS.some((f) => f in m)) return false
+  if (m.role === "user") return stripExtraFields(m, ["role", "content"]) || changed
+  if (!THINKING_FIELDS.some((f) => f in m)) return changed
   const think = thinkingText(m)
   for (const f of THINKING_FIELDS) delete m[f]
   if (think === "" || m.role !== "assistant" || m.prefix === true) return true
   const part = { type: "thinking", thinking: [{ type: "text", text: think }] }
-  const c = m.content
   if (typeof c === "string") m.content = c === "" ? [part] : [part, { type: "text", text: c }]
   else if (Array.isArray(c)) m.content = [part, ...c]
   else m.content = [part]
