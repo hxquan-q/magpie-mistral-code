@@ -35,6 +35,9 @@ const consoleApi = () => (process.env.MISTRAL_VIBE_CONSOLE_API || "https://conso
 
 const POLL_EVERY_MS = 1500
 const SIGN_IN_TTL_MS = 10 * 60 * 1000
+// one sign-in call's own deadline: the console answers these in well under a
+// second, so a call still open after this is a dead connection to replace
+const SIGN_IN_CALL_MS = 20_000
 const DEFAULT_LIMIT = { context: 262_144, output: 65_536 }
 
 // Prices from https://docs.mistral.ai/inference/pricing (USD per 1M tokens,
@@ -76,53 +79,263 @@ const sleep = (ms, signal) =>
 
 const keyOf = (auth) => (auth?.type === "api" || auth?.key ? auth.key : auth?.access) || ""
 
+// ---- transport ----------------------------------------------------------
+//
+// Bun's fetch pools connections between requests. api.mistral.ai and
+// console.mistral.ai are served behind Cloudflare, which closes an idle
+// keep-alive connection on its own schedule; when the pool hands that socket
+// to the next request, the write meets the closed peer and Bun fails the call
+// before the request goes out:
+//
+//   ECONNRESET: The socket connection was closed unexpectedly. For more
+//   information, pass verbose: true in the second argument to fetch()
+//
+// The dead socket is dropped with the error, so one retry takes a fresh
+// connection. A POST is retried too, and only safely so: fetch resolves as
+// soon as the response headers arrive, so an error thrown by the await means
+// the response never started. A reset after the headers, a timeout and an
+// abort come back as they are.
+const STALE_SOCKET =
+  /socket connection was closed unexpectedly|other side closed|connection closed|socket hang up/i
+
+// STALE_CODES are the errno names both runtimes put on a connection the peer
+// (or the pool) had already torn down: Node's undici reports ECONNRESET /
+// UND_ERR_SOCKET, Bun its own ECONNRESET / ConnectionClosed, and a write to a
+// half-closed socket is EPIPE.
+const STALE_CODES = new Set(["ECONNRESET", "ECONNABORTED", "UND_ERR_SOCKET", "UND_ERR_CLOSED", "ConnectionClosed", "EPIPE"])
+
+function staleSocket(e) {
+  // a call the caller cancelled or that ran out of time says nothing about
+  // the pool: it is the answer, not a socket the peer had already closed
+  if (!e || typeof e !== "object") return false
+  if (e.name === "AbortError" || e.name === "TimeoutError") return false
+  for (const code of [e.code, e.cause?.code, e.errno, e.cause?.errno]) if (STALE_CODES.has(code)) return true
+  return STALE_SOCKET.test(`${e.message ?? ""} ${e.cause?.message ?? ""}`)
+}
+
+// NET_CODES are the failures a sign-in's poll loop rides out: the network was
+// briefly not there, or the edge was busy, and the same call a moment later
+// is the right one. It is the loop's own retry, not the socket one above.
+const NET_CODES = new Set([
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ETIMEDOUT",
+  "ECONNREFUSED",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+])
+
+function transient(e) {
+  if (!e || typeof e !== "object") return false
+  if (e.name === "AbortError") return false
+  if (e.transient === true || staleSocket(e)) return true
+  if (e.name === "TimeoutError") return true
+  return NET_CODES.has(e.code ?? e.cause?.code ?? e.errno)
+}
+
+// drain reads a response's body to its end and gives back the text, so its
+// connection goes back to the pool reusable rather than half-read (a cancel
+// would drop the socket). A body that fails mid-read is cancelled instead.
+async function drain(res) {
+  try {
+    if (res?.body && !res.bodyUsed) return await res.text()
+  } catch {}
+  try {
+    await res?.body?.cancel?.()
+  } catch {}
+  return ""
+}
+
+// RETRY_MS is the first pause before a stale-socket retry; each attempt
+// waits a little longer, so a pool still handing back dead sockets is given
+// the time to notice, without a caller's deadline being spent at once.
+const RETRY_MS = 200
+const READ_TRIES = 2
+// the sign-in steps get one more try than a plain read: they run once, by
+// hand, and a reset that eats them costs the user the whole browser round
+// trip rather than a page of numbers
+const SIGN_IN_TRIES = 3
+const retryDelay = (attempt) => RETRY_MS * (attempt + 1) + Math.floor(Math.random() * 100)
+
+// send is fetch with the stale-socket retry: a GET or HEAD twice, a POST once.
+// A body that is a string, a Buffer or a Blob goes out again as it is; a
+// Request's body is cloned ahead of the first send, because fetch spends it.
+// A ReadableStream body is the one thing that can't be replayed, so that
+// request is sent once and its error surfaces — and so is a Request whose
+// body was locked before the clone, which would otherwise go out a second
+// time with nothing left to send.
+async function send(input, init = {}, { retries } = {}) {
+  const method = String(init.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase()
+  const idempotent = method === "GET" || method === "HEAD" || method === "OPTIONS"
+  const req = input instanceof Request ? input : null
+  const streamed = init.body && typeof init.body === "object" && typeof init.body.getReader === "function"
+  // the spare is taken before the first send consumes the original; an
+  // init.body replaces the Request's own, so the spare only stands in when
+  // there isn't one
+  let spare = null
+  if (req?.body && init.body === undefined) {
+    try {
+      spare = req.clone()
+    } catch {}
+  }
+  const replayable = !streamed && (!req?.body || init.body !== undefined || spare !== null)
+  const budget = replayable ? retries ?? (idempotent ? 2 : 1) : 0
+  for (let attempt = 0; ; attempt++) {
+    const arg = attempt > 0 && spare ? spare : input
+    try {
+      return await fetch(arg, init)
+    } catch (e) {
+      if (init.signal?.aborted || attempt >= budget || !staleSocket(e)) throw e
+      await sleep(retryDelay(attempt), init.signal)
+    }
+  }
+}
+
+// readJSON is a request and its body as JSON, with the stale-socket retry
+// covering both halves. fetch resolves at the response headers, so a peer
+// that resets the connection after them fails res.text() instead — the same
+// dead socket, one step later, and just as safe to ask again. Reads go
+// through here, and so do the two sign-in steps whose repeat is harmless (a
+// second start leaves an unused process behind, an exchange with the same
+// token either hands out the key or does not); a chat body is streamed and
+// is never read inside the retry.
+async function readJSON(url, init = {}, { retries = READ_TRIES } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const res = await send(url, init, { retries: 0 })
+      if (!res.ok) {
+        // a refusal's body is the server's own explanation of it; it is read
+        // once, kept for the error message, and the connection goes back whole
+        const text = await drain(res)
+        return { res, data: null, text }
+      }
+      const text = await res.text()
+      let data = null
+      try {
+        data = text ? JSON.parse(text) : null
+      } catch {}
+      return { res, data, text }
+    } catch (e) {
+      if (init.signal?.aborted || attempt >= retries || !staleSocket(e)) throw e
+      await sleep(retryDelay(attempt), init.signal)
+    }
+  }
+}
+
+// why says what a refusal said, in the few words the console puts in it
+// (`{"detail":"..."}`, `{"message":"..."}`, `{"error":"..."}`), so a 4xx reads
+// as the server's answer rather than only its number.
+function why(text) {
+  if (typeof text !== "string" || text === "") return ""
+  try {
+    const d = JSON.parse(text)
+    const v = d?.detail ?? d?.message ?? d?.error ?? d?.error_description
+    if (typeof v === "string" && v !== "") return `: ${v}`
+  } catch {}
+  const s = text.replace(/\s+/g, " ").trim()
+  return s ? `: ${s.slice(0, 200)}` : ""
+}
+
 // ---- the browser sign-in (vibe's setup/auth/http_browser_sign_in_gateway) ----
 
 const newVerifier = () => randomBytes(48).toString("base64url")
 const challengeOf = (verifier) => createHash("sha256").update(verifier).digest("base64url")
 
+// UA is the client identity the official CLI sends (mistral-vibe
+// vibe/utils/http.py: get_user_agent). console.mistral.ai sits behind
+// Cloudflare, and the sign-in endpoints are the ones it is most particular
+// about: a request that names a bare runtime (`Bun/1.2.21`) is the one that
+// gets a connection dropped under it, which is what a login that never
+// finishes looks like. The same identity goes on every console and API call.
+const UA = () => process.env.MISTRAL_VIBE_UA || "mistral-client-python/Mistral-Vibe/3.1.3"
+
+// consoleHeaders are the sign-in calls' headers: the CLI's identity, and no
+// keep-alive reuse — these are three one-shot calls in a row, and a
+// connection the pool kept from the last one is exactly what Cloudflare has
+// already closed by the time the next is written.
+function consoleHeaders(extra = {}) {
+  return {
+    accept: "application/json",
+    "user-agent": UA(),
+    connection: "close",
+    ...extra,
+  }
+}
+
+// withTimeout gives a call its own deadline beside the caller's: whichever
+// comes first ends it, and an abort the caller made still reads as one.
+function withTimeout(signal, ms) {
+  const t = AbortSignal.timeout(ms)
+  if (!signal) return t
+  return typeof AbortSignal.any === "function" ? AbortSignal.any([signal, t]) : signal
+}
+
 async function startSignIn(signal) {
   const code_verifier = newVerifier()
-  const res = await fetch(`${consoleApi()}/vibe/sign-in`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ code_challenge: challengeOf(code_verifier), code_challenge_method: "S256" }),
-    signal,
-  })
-  if (!res.ok) throw new Error(`Mistral sign-in could not start (${res.status})`)
-  const d = await res.json()
+  // readJSON, not send: the payload comes back in the body, and a reset that
+  // lands between the headers and the body is the same dead socket one step
+  // later. A second start on a fresh connection is harmless — the process it
+  // leaves unused expires on its own.
+  const { res, data: d, text } = await readJSON(
+    `${consoleApi()}/vibe/sign-in`,
+    {
+      method: "POST",
+      headers: consoleHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ code_challenge: challengeOf(code_verifier), code_challenge_method: "S256" }),
+      // a start that hangs is retried by the deadline, not waited on forever
+      signal: withTimeout(signal, SIGN_IN_CALL_MS),
+    },
+    { retries: SIGN_IN_TRIES }
+  )
+  if (!res.ok) throw new Error(`Mistral sign-in could not start (${res.status})${why(text)}`)
   if (!d?.process_id || !d?.sign_in_url || !d?.poll_url) throw new Error("Mistral sign-in answered an unexpected payload")
   return { process_id: d.process_id, sign_in_url: d.sign_in_url, poll_url: d.poll_url, expires_at: d.expires_at, code_verifier }
 }
 
+function signInResponseError(status, message) {
+  const error = new Error(message)
+  if (status === 429 || status >= 500) error.transient = true
+  return error
+}
+
 async function pollSignIn(pollUrl, signal) {
-  const res = await fetch(pollUrl, { signal })
+  const { res, data, text } = await readJSON(
+    pollUrl,
+    { headers: consoleHeaders(), signal: withTimeout(signal, SIGN_IN_CALL_MS) },
+    { retries: SIGN_IN_TRIES }
+  )
   if (res.status === 410) return { status: "expired" }
-  if (!res.ok) throw new Error(`Mistral sign-in poll answered ${res.status}`)
-  return await res.json()
+  if (!res.ok) throw signInResponseError(res.status, `Mistral sign-in poll answered ${res.status}${why(text)}`)
+  return data
 }
 
 async function exchangeSignIn(processId, exchangeToken, codeVerifier, signal) {
-  const res = await fetch(`${consoleApi()}/vibe/sign-in/${encodeURIComponent(processId)}/exchange`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ exchange_token: exchangeToken, code_verifier: codeVerifier }),
-    signal,
-  })
-  if (!res.ok) throw new Error(`Mistral sign-in exchange failed (${res.status})`)
-  const d = await res.json()
+  // an exchange repeats on the same token, so a stale socket is safe to
+  // retry here too: the server either hands out the key or has already
+  // spent the token, and the second answer is the real one
+  const { res, data: d, text } = await readJSON(
+    `${consoleApi()}/vibe/sign-in/${encodeURIComponent(processId)}/exchange`,
+    {
+      method: "POST",
+      headers: consoleHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ exchange_token: exchangeToken, code_verifier: codeVerifier }),
+      signal: withTimeout(signal, SIGN_IN_CALL_MS),
+    },
+    { retries: SIGN_IN_TRIES }
+  )
+  if (!res.ok) throw signInResponseError(res.status, `Mistral sign-in exchange failed (${res.status})${why(text)}`)
   if (!d?.api_key) throw new Error("Mistral sign-in exchange returned no API key")
   return d.api_key
 }
 
 // whoami names the plan behind a key (console.mistral.ai/api/vibe/whoami)
 async function whoami(key) {
-  const res = await fetch(`${consoleApi()}/vibe/whoami`, {
-    headers: { Authorization: `Bearer ${key}` },
+  const { res, data } = await readJSON(`${consoleApi()}/vibe/whoami`, {
+    headers: consoleHeaders({ Authorization: `Bearer ${key}` }),
     signal: AbortSignal.timeout(8000),
   })
-  if (!res.ok) return null
-  return await res.json().catch(() => null)
+  return res.ok ? data : null
 }
 
 // ---- models: /v1/models, limits filled from models.dev when it knows them ----
@@ -131,9 +344,8 @@ let devModels = null
 async function modelsDev() {
   if (devModels) return devModels
   try {
-    const res = await fetch("https://models.dev/api.json", { signal: AbortSignal.timeout(5000) })
-    const j = await res.json()
-    devModels = j?.mistral?.models ?? {}
+    const { res, data } = await readJSON("https://models.dev/api.json", { signal: AbortSignal.timeout(5000) })
+    devModels = res.ok ? (data?.mistral?.models ?? {}) : {}
   } catch {
     devModels = {}
   }
@@ -167,12 +379,11 @@ function priceOf(m, dev) {
 }
 
 async function listModels(key) {
-  const res = await fetch(`${apiBase()}/models`, {
+  const { res, data: j } = await readJSON(`${apiBase()}/models`, {
     headers: { Authorization: `Bearer ${key}` },
     signal: AbortSignal.timeout(15_000),
   })
   if (!res.ok) return null
-  const j = await res.json().catch(() => null)
   const dev = await modelsDev()
   const out = {}
   for (const m of j?.data ?? []) {
@@ -231,9 +442,8 @@ async function listModels(key) {
 async function readUsage(key) {
   const headers = { Authorization: `Bearer ${key}` }
   const ask = async (url) => {
-    const res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) })
-    if (!res.ok) return null
-    return await res.json().catch(() => null)
+    const { res, data } = await readJSON(url, { headers, signal: AbortSignal.timeout(8000) })
+    return res.ok ? data : null
   }
   const [subscription, budget, who] = await Promise.all([
     ask(`${apiBase()}/billing/subscription`),
@@ -377,9 +587,9 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
           if (body !== init.body) {
             // the length the engine counted is not the one sent
             headers.delete("content-length")
-            return fetch(input, { ...init, headers, body })
+            return send(input, { ...init, headers, body })
           }
-          return fetch(input, { ...init, headers })
+          return send(input, { ...init, headers })
         },
       }
     },
@@ -394,26 +604,44 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
             instructions: "Sign in to your Mistral account on the page that opens. The sign-in finishes here by itself.",
             method: "auto",
             callback: async (_code, { signal: cbSignal } = {}) => {
-              const s = cbSignal ?? signal
+              // the host's authorize signal often ends with the authorize
+              // call; using it here would cancel the first poll at once, and
+              // the sign-in would never be seen through
+              const s = cbSignal ?? (signal?.aborted ? undefined : signal)
               const deadline = (Date.parse(p.expires_at) || Date.now() + SIGN_IN_TTL_MS)
+              // a poll that fails on a dead pooled socket, a 429 or a 5xx is
+              // the network, not the sign-in: the loop asks again until the
+              // link's own deadline. A 4xx that isn't 410 is the server
+              // refusing the process, and asking again would only repeat it.
+              let misses = 0
               for (;;) {
                 let r
                 try {
                   r = await pollSignIn(p.poll_url, s)
+                  misses = 0
                 } catch (e) {
+                  if (s?.aborted) throw e
+                  if (!transient(e)) return { type: "failed", error: e?.message ?? String(e) }
                   if (Date.now() > deadline) return { type: "failed", error: `Sign-in poll failed: ${e?.message ?? e}` }
-                  await sleep(POLL_EVERY_MS, s)
+                  misses++
+                  await sleep(Math.min(POLL_EVERY_MS * misses, 10_000), s)
                   continue
                 }
                 if (r?.status === "completed" && r.exchange_token) {
-                  try {
-                    const key = await exchangeSignIn(p.process_id, r.exchange_token, p.code_verifier, s)
-                    const who = await whoami(key).catch(() => null)
-                    const out = { type: "success", key, metadata: { plan: who?.plan_name, vibeEntitlement: who?.has_paid_vibe_entitlement } }
-                    if (who?.customer_id != null) out.accountId = String(who.customer_id)
-                    return out
-                  } catch (e) {
-                    return { type: "failed", error: `Sign-in exchange failed: ${e?.message ?? e}` }
+                  // the token stays good until the process expires, so a
+                  // transient failure here is asked again rather than thrown
+                  // away: the user's browser round trip is not spent twice
+                  for (;;) {
+                    try {
+                      const key = await exchangeSignIn(p.process_id, r.exchange_token, p.code_verifier, s)
+                      const who = await whoami(key).catch(() => null)
+                      const out = { type: "success", key, metadata: { plan: who?.plan_name, vibeEntitlement: who?.has_paid_vibe_entitlement } }
+                      if (who?.customer_id != null) out.accountId = String(who.customer_id)
+                      return out
+                    } catch (e) {
+                      if (!transient(e) || Date.now() > deadline) return { type: "failed", error: `Sign-in exchange failed: ${e?.message ?? e}` }
+                      await sleep(POLL_EVERY_MS, s)
+                    }
                   }
                 }
                 if (r?.status === "expired") return { type: "failed", error: "The sign-in expired; start it again" }
@@ -445,4 +673,27 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
 })
 
 // for tests
-export const _internal = { startSignIn, pollSignIn, exchangeSignIn, whoami, listModels, readUsage, keyOf, priceOf, DOCS_PRICES, mistralBody, THINKING_FIELDS, ID, apiBase, consoleApi }
+export const _internal = {
+  startSignIn,
+  pollSignIn,
+  exchangeSignIn,
+  whoami,
+  listModels,
+  readUsage,
+  keyOf,
+  priceOf,
+  DOCS_PRICES,
+  mistralBody,
+  THINKING_FIELDS,
+  ID,
+  apiBase,
+  consoleApi,
+  send,
+  readJSON,
+  drain,
+  staleSocket,
+  transient,
+  why,
+  SIGN_IN_TRIES,
+  READ_TRIES,
+}

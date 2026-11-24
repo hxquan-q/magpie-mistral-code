@@ -95,6 +95,7 @@ agent 回传历史时会带 `reasoning_content` / `reasoning` / `reasoning_detai
 | 现象 | 处理 |
 | --- | --- |
 | `sign-in could not start (429)` | 登录发起端点有频率限制，停 15–30 分钟后**只试一次**，不要连点 |
+| `ECONNRESET: The socket connection was closed unexpectedly` | 连接池里的旧 keep-alive 套接字被 Cloudflare 关掉了。插件已自动换连接重试（发起/轮询/交换各 3 次，轮询与交换在链接 10 分钟有效期内对 429、5xx、断网继续退避重试），无需手动处理；若仍出现，重跑 `magpie plugin login mistral-vibe` 即可 |
 | `context deadline exceeded` / poll 429 | 链接 10 分钟内没点，重新 `magpie plugin login mistral-vibe` |
 | 界面显示「暂无额度数据」 | GUI 缓存，重开设置页或重启 magpie 窗口 |
 | 扣的是 API 额度 | 用的是 console 平台 key，删掉该账号后用浏览器登录重铸 |
@@ -110,7 +111,7 @@ agent 回传历史时会带 `reasoning_content` / `reasoning` / `reasoning_detai
 
 ## 致谢
 
-上游：[songlairui/magpie-mistral-code](https://github.com/songlairui/magpie-mistral-code)。本 fork 的两处改动：额度按美元展示、出站 UA 对齐官方客户端。
+上游：[songlairui/magpie-mistral-code](https://github.com/songlairui/magpie-mistral-code)。本 fork 的改动：额度按美元展示、出站 UA 对齐官方客户端、传输层对失效 keep-alive 套接字自动重试（登录不再因 `ECONNRESET` 中断）。
 
 ## License
 

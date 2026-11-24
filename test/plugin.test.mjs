@@ -295,7 +295,10 @@ test("package.json gives the plugin its own logo", async () => {
   expect(pkg.magpie.icon.startsWith("data:image/svg+xml;base64,")).toBe(true)
   const svg = Buffer.from(pkg.magpie.icon.slice(pkg.magpie.icon.indexOf(",") + 1), "base64").toString("utf8")
   const file = await readFile(new URL("../assets/icon.svg", import.meta.url), "utf8")
-  expect(svg).toBe(file)
+  // the working tree's line endings are the checkout's business; the bytes
+  // the icon is made of are not
+  const lf = (s) => s.replace(/\r\n/g, "\n")
+  expect(lf(svg)).toBe(lf(file))
   expect(svg).toContain("<svg")
   expect(svg).toContain("</svg>")
   expect(pkg.files).toContain("assets/icon.svg")
@@ -399,6 +402,201 @@ test("a body with nothing to move comes back untouched", () => {
   expect(mistralBody(undefined)).toBe(undefined)
 })
 
+// ---- the transport ------------------------------------------------------
+//
+// Bun's fetch pools keep-alive connections and hands a socket Cloudflare has
+// already closed to the next request; the write fails with
+//
+//   ECONNRESET: The socket connection was closed unexpectedly. For more
+//   information, pass verbose: true in the second argument to fetch()
+//
+// send() retries that one failure on a fresh connection: twice for a GET,
+// once for a POST (the error is raised before the request goes out).
+
+const resetError = () => {
+  const e = new Error("ECONNRESET: The socket connection was closed unexpectedly. For more information, pass verbose: true in the second argument to fetch()")
+  e.code = "ECONNRESET"
+  return e
+}
+
+test("a stale pooled socket is retried once on a fresh connection", async () => {
+  const { send } = _internal
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    if (calls === 1) throw resetError()
+    return new Response("ok")
+  }
+  const res = await send("http://mock.local/v1/chat/completions", { method: "POST", body: "{}" })
+  expect(res.status).toBe(200)
+  expect(calls).toBe(2)
+})
+
+test("a GET retries twice, and a repeated failure still surfaces", async () => {
+  const { send } = _internal
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    throw resetError()
+  }
+  await expect(send("http://mock.local/v1/models")).rejects.toThrow(/ECONNRESET/)
+  expect(calls).toBe(3)
+})
+
+test("an error that is not a stale socket is not retried", async () => {
+  const { send } = _internal
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    const e = new Error("getaddrinfo ENOTFOUND api.mistral.ai")
+    e.code = "ENOTFOUND"
+    throw e
+  }
+  await expect(send("http://mock.local/v1/models")).rejects.toThrow(/ENOTFOUND/)
+  expect(calls).toBe(1)
+})
+
+test("an abort is not retried", async () => {
+  const { send } = _internal
+  let calls = 0
+  const ac = new AbortController()
+  globalThis.fetch = async () => {
+    calls++
+    ac.abort()
+    const e = new Error("The operation was aborted")
+    e.name = "AbortError"
+    throw e
+  }
+  await expect(send("http://mock.local/v1/models", { signal: ac.signal })).rejects.toThrow()
+  expect(calls).toBe(1)
+})
+
+// Bun's AbortSignal.timeout surfaces as a TimeoutError whose message says
+// nothing about sockets; asking a peer that never answered again only spends
+// the caller's deadline a second time
+test("a timeout is not retried", async () => {
+  const { send, readJSON } = _internal
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    const e = new Error("The operation timed out.")
+    e.name = "TimeoutError"
+    throw e
+  }
+  await expect(send("http://mock.local/v1/models", { signal: AbortSignal.timeout(50) })).rejects.toThrow(/timed out/)
+  expect(calls).toBe(1)
+  calls = 0
+  await expect(readJSON("http://mock.local/v1/models", { signal: AbortSignal.timeout(50) })).rejects.toThrow(/timed out/)
+  expect(calls).toBe(1)
+})
+
+test("a stream body is sent once, never replayed", async () => {
+  const { send } = _internal
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    throw resetError()
+  }
+  const body = new ReadableStream({ start: (c) => c.close() })
+  await expect(send("http://mock.local/v1/chat/completions", { method: "POST", body })).rejects.toThrow(/ECONNRESET/)
+  expect(calls).toBe(1)
+})
+
+test("a Request's body is replayed from a clone", async () => {
+  const { send } = _internal
+  const seen = []
+  let calls = 0
+  globalThis.fetch = async (input) => {
+    calls++
+    seen.push(await (input instanceof Request ? input.text() : String(input)))
+    if (calls === 1) throw resetError()
+    return new Response("ok")
+  }
+  const req = new Request("http://mock.local/v1/chat/completions", { method: "POST", body: "{\"a\":1}" })
+  const res = await send(req)
+  expect(res.status).toBe(200)
+  expect(calls).toBe(2)
+  expect(seen).toEqual(["{\"a\":1}", "{\"a\":1}"])
+})
+
+test("a refusal is drained so its connection goes back whole", async () => {
+  mockFetch()
+  const { whoami, listModels } = _internal
+  // the stand-in answers whoami with 401 for any key but KEY
+  expect(await whoami("bad")).toBeNull()
+  // a refusal from /v1/models falls back to no list
+  expect(await listModels("bad")).toBeNull()
+})
+
+// fetch resolves at the response headers, so a peer that resets the
+// connection after them fails the body read instead of the call. A read has
+// no side effect to repeat, so readJSON asks again from the top.
+test("a reset after the headers is retried, body and all", async () => {
+  const { readJSON } = _internal
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    if (calls === 1) {
+      const body = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('{"data":'))
+          c.error(resetError())
+        },
+      })
+      return new Response(body, { status: 200, headers: { "content-type": "application/json" } })
+    }
+    return new Response('{"data":[{"id":"m"}]}', { status: 200, headers: { "content-type": "application/json" } })
+  }
+  const { res, data } = await readJSON("http://mock.local/v1/models")
+  expect(res.status).toBe(200)
+  expect(data).toEqual({ data: [{ id: "m" }] })
+  expect(calls).toBe(2)
+})
+
+test("a body read that keeps failing still surfaces", async () => {
+  const { readJSON } = _internal
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    const body = new ReadableStream({
+      start(c) {
+        c.error(resetError())
+      },
+    })
+    return new Response(body, { status: 200 })
+  }
+  await expect(readJSON("http://mock.local/v1/models")).rejects.toThrow(/ECONNRESET/)
+  expect(calls).toBe(3)
+})
+
+test("a refusal is not replayed by readJSON", async () => {
+  const { readJSON } = _internal
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    return new Response('{"detail":"nope"}', { status: 401, headers: { "content-type": "application/json" } })
+  }
+  const { res, data } = await readJSON("http://mock.local/api/vibe/whoami")
+  expect(res.status).toBe(401)
+  expect(data).toBeNull()
+  expect(calls).toBe(1)
+})
+
+// a Request whose body was locked before the clone has nothing left to send,
+// so a second attempt would replace the real error with "Body already used"
+test("a Request with an uncloneable body is not replayed", async () => {
+  const { send } = _internal
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    throw resetError()
+  }
+  const req = new Request("http://mock.local/v1/chat/completions", { method: "POST", body: "{}" })
+  await req.text() // spends the body: clone() now throws
+  await expect(send(req)).rejects.toThrow(/ECONNRESET/)
+  expect(calls).toBe(1)
+})
+
 // and the loader does it on the way out, so a gateway that sends an earlier
 // turn's thinking as reasoning_content reaches Mistral with the part instead
 test("the loader puts an earlier turn's thinking in the typed part", async () => {
@@ -423,4 +621,191 @@ test("the loader puts an earlier turn's thinking in the typed part", async () =>
     content: [{ type: "thinking", thinking: [{ type: "text", text: "thinking here" }] }, { type: "text", text: "Let me check." }],
   })
   expect(state.bodies[0]).not.toContain("reasoning_content")
+})
+
+// ---- the sign-in over a dead socket -------------------------------------
+//
+// The browser sign-in runs once, by hand, and its three calls are the ones
+// the user can't repeat without another trip through the browser. Each of
+// them goes through readJSON, so a socket the pool had already lost is
+// replaced instead of ending the sign-in.
+test("a reset while the sign-in starts is retried, and the process is kept", async () => {
+  const { startSignIn } = _internal
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    if (calls === 1) throw resetError()
+    return new Response(
+      JSON.stringify({
+        process_id: "p9",
+        sign_in_url: "https://console.mistral.ai/login?process=p9",
+        poll_url: "http://mock.local/api/vibe/sign-in/p9/poll",
+        expires_at: new Date(Date.now() + 600_000).toISOString(),
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    )
+  }
+  const p = await startSignIn()
+  expect(p.process_id).toBe("p9")
+  expect(p.code_verifier.length).toBeGreaterThan(20)
+  expect(calls).toBe(2)
+})
+
+test("a reset while the sign-in polls or exchanges is retried", async () => {
+  const { pollSignIn, exchangeSignIn } = _internal
+  let calls = 0
+  globalThis.fetch = async (input, init = {}) => {
+    calls++
+    if (calls === 1) throw resetError()
+    const u = new URL(String(input))
+    const json = (v) => new Response(JSON.stringify(v), { status: 200, headers: { "content-type": "application/json" } })
+    if (u.pathname.endsWith("/poll")) return json({ status: "completed", exchange_token: "et-2" })
+    if (u.pathname.endsWith("/exchange")) return json({ api_key: KEY })
+    return json({})
+  }
+  expect((await pollSignIn("http://mock.local/api/vibe/sign-in/p9/poll")).exchange_token).toBe("et-2")
+  calls = 0
+  expect(await exchangeSignIn("p9", "et-2", "verifier")).toBe(KEY)
+  expect(calls).toBe(2)
+})
+
+test("the sign-in's failures carry what the console said", async () => {
+  const { startSignIn, pollSignIn } = _internal
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ detail: "Too many sign-in attempts" }), { status: 429, headers: { "content-type": "application/json" } })
+  await expect(startSignIn()).rejects.toThrow(/429\): Too many sign-in attempts/)
+  const e = await pollSignIn("http://mock.local/api/vibe/sign-in/p9/poll").catch((x) => x)
+  expect(e.transient).toBe(true)
+  expect(String(e.message)).toContain("Too many sign-in attempts")
+})
+
+test("a poll refusal that is not a rate limit or a 5xx ends the sign-in", async () => {
+  const { pollSignIn } = _internal
+  globalThis.fetch = async () => new Response(JSON.stringify({ detail: "unknown process" }), { status: 404 })
+  const e = await pollSignIn("http://mock.local/api/vibe/sign-in/p9/poll").catch((x) => x)
+  expect(e.transient).toBeUndefined()
+  expect(String(e.message)).toContain("404: unknown process")
+})
+
+// the loop over the poll: a 429 is asked again rather than reported, and a
+// 404 is the answer (the same stand-in answers both here)
+test("the sign-in's poll loop rides out a rate limit and gives up on a refusal", async () => {
+  const hooks = await plugin()
+  const oauth = hooks.auth.methods.find((m) => m.type === "oauth")
+  let polls = 0
+  globalThis.fetch = async (input) => {
+    const u = new URL(String(input))
+    const json = (v, status = 200) => new Response(JSON.stringify(v), { status, headers: { "content-type": "application/json" } })
+    if (u.pathname === "/api/vibe/sign-in")
+      return json({
+        process_id: "p3",
+        sign_in_url: "https://console.mistral.ai/login?process=p3",
+        poll_url: "http://mock.local/api/vibe/sign-in/p3/poll",
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+      })
+    if (u.pathname.endsWith("/poll")) {
+      polls++
+      if (polls === 1) return json({ detail: "slow down" }, 429)
+      return json({ status: "completed", exchange_token: "et-3" })
+    }
+    if (u.pathname.endsWith("/exchange")) return json({ api_key: KEY })
+    if (u.pathname === "/api/vibe/whoami") return json({ plan_name: "Vibe Pro", customer_id: "cust-3" })
+    return json({}, 404)
+  }
+  const started = await oauth.authorize()
+  const r = await started.callback()
+  expect(r.type).toBe("success")
+  expect(r.key).toBe(KEY)
+  expect(polls).toBe(2)
+})
+
+test("the sign-in retries the exchange after a rate limit and a server error", async () => {
+  mockFetch()
+  const fetch = globalThis.fetch
+  const statuses = [429, 503]
+  const bodies = []
+  globalThis.fetch = async (input, init = {}) => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith("/poll")) return Response.json({ status: "completed", exchange_token: "et-1" })
+    if (path.endsWith("/exchange")) {
+      const status = statuses[bodies.length]
+      bodies.push(init.body)
+      if (status) return Response.json({ detail: "try again" }, { status })
+    }
+    return fetch(input, init)
+  }
+
+  const hooks = await plugin()
+  const oauth = hooks.auth.methods.find((m) => m.type === "oauth")
+  const started = await oauth.authorize()
+  const result = await started.callback()
+
+  expect(result.type).toBe("success")
+  expect(result.key).toBe(KEY)
+  expect(bodies).toHaveLength(3)
+  expect(new Set(bodies).size).toBe(1)
+})
+
+test("a dead socket at the very start is not reported as a sign-in failure", async () => {
+  const hooks = await plugin()
+  const oauth = hooks.auth.methods.find((m) => m.type === "oauth")
+  let calls = 0
+  globalThis.fetch = async (input) => {
+    calls++
+    if (calls === 1) throw resetError()
+    const u = new URL(String(input))
+    const json = (v) => new Response(JSON.stringify(v), { status: 200, headers: { "content-type": "application/json" } })
+    if (u.pathname === "/api/vibe/sign-in") return json({ process_id: "p4", sign_in_url: "https://x/", poll_url: "http://mock.local/api/vibe/sign-in/p4/poll", expires_at: new Date(Date.now() + 60_000).toISOString() })
+    if (u.pathname.endsWith("/poll")) return json({ status: "completed", exchange_token: "et-4" })
+    if (u.pathname.endsWith("/exchange")) return json({ api_key: KEY })
+    return json({})
+  }
+  const started = await oauth.authorize()
+  expect(started.url).toBe("https://x/")
+  expect(calls).toBe(2)
+})
+
+// The host hands authorize a signal that lives as long as the authorize call.
+// It is usually already aborted by the time the browser comes back, and the
+// callback must not inherit that: it would cancel the first poll and the
+// sign-in would never be seen through.
+test("an authorize signal that ended with authorize does not cancel the callback", async () => {
+  const hooks = await plugin()
+  const oauth = hooks.auth.methods.find((m) => m.type === "oauth")
+  globalThis.fetch = async (input) => {
+    const u = new URL(String(input))
+    const json = (v) => new Response(JSON.stringify(v), { status: 200, headers: { "content-type": "application/json" } })
+    if (u.pathname === "/api/vibe/sign-in")
+      return json({ process_id: "p5", sign_in_url: "https://x/", poll_url: "http://mock.local/api/vibe/sign-in/p5/poll", expires_at: new Date(Date.now() + 60_000).toISOString() })
+    if (u.pathname.endsWith("/poll")) return json({ status: "completed", exchange_token: "et-5" })
+    if (u.pathname.endsWith("/exchange")) return json({ api_key: KEY })
+    if (u.pathname === "/api/vibe/whoami") return json({ plan_name: "Vibe Pro", customer_id: "cust-5" })
+    return json({}, 404)
+  }
+  const gone = new AbortController()
+  const started = await oauth.authorize({}, { signal: gone.signal })
+  gone.abort()
+  const r = await started.callback()
+  expect(r.type).toBe("success")
+  expect(r.key).toBe(KEY)
+})
+
+// A callback signal the host does supply is still honoured.
+test("a callback signal that aborts ends the wait", async () => {
+  const hooks = await plugin()
+  const oauth = hooks.auth.methods.find((m) => m.type === "oauth")
+  globalThis.fetch = async (input) => {
+    const u = new URL(String(input))
+    const json = (v) => new Response(JSON.stringify(v), { status: 200, headers: { "content-type": "application/json" } })
+    if (u.pathname === "/api/vibe/sign-in")
+      return json({ process_id: "p6", sign_in_url: "https://x/", poll_url: "http://mock.local/api/vibe/sign-in/p6/poll", expires_at: new Date(Date.now() + 60_000).toISOString() })
+    return json({ status: "pending" })
+  }
+  const started = await oauth.authorize()
+  const stop = new AbortController()
+  const pending = started.callback(undefined, { signal: stop.signal })
+  setTimeout(() => stop.abort(), 50)
+  const e = await pending.catch((x) => x)
+  expect(e).toBeTruthy()
+  expect(e.name).toBe("AbortError")
 })
