@@ -303,17 +303,11 @@ async function readJSON(url, init = {}, { retries = READ_TRIES } = {}) {
     try {
       const res = await fetch(url, init)
       if (!res.ok) {
-        // a refusal's body is the server's own explanation of it; it is read
-        // once, kept for the error message, and the connection goes back whole
-        const text = await drain(res)
-        return { res, data: null, text }
+        // A refusal is read once and kept for the error message.
+        return { res, data: null, text: await drain(res) }
       }
       const text = await res.text()
-      let data = null
-      try {
-        data = text ? JSON.parse(text) : null
-      } catch {}
-      return { res, data, text }
+      return { res, data: parseJSON(text), text }
     } catch (e) {
       if (init.signal?.aborted || attempt >= retries || !staleSocket(e)) throw e
       await sleep(retryDelay(attempt), init.signal)
@@ -321,16 +315,19 @@ async function readJSON(url, init = {}, { retries = READ_TRIES } = {}) {
   }
 }
 
+function parseJSON(text) {
+  try {
+    if (text) return JSON.parse(text)
+  } catch {}
+  return null
+}
+
 // why says what a refusal said, in the few words the console puts in it
 // (`{"detail":"..."}`, `{"message":"..."}`, `{"error":"..."}`), so a 4xx reads
 // as the server's answer rather than only its number.
-function why(text) {
-  if (typeof text !== "string" || text === "") return ""
-  try {
-    const d = JSON.parse(text)
-    const v = d?.detail ?? d?.message ?? d?.error ?? d?.error_description
-    if (typeof v === "string" && v !== "") return `: ${v}`
-  } catch {}
+function why(text, data = parseJSON(text)) {
+  const detail = data?.detail ?? data?.message ?? data?.error ?? data?.error_description
+  if (typeof detail === "string" && detail !== "") return `: ${detail}`
   const s = text.replace(/\s+/g, " ").trim()
   return s ? `: ${s.slice(0, 200)}` : ""
 }
@@ -406,6 +403,12 @@ function signInResponseError(status, message) {
   return error
 }
 
+function retryAfterMs(value) {
+  if (!value) return 0
+  if (/^\d+$/.test(value)) return Number(value) * 1000
+  return Math.max(0, Date.parse(value) - Date.now()) || 0
+}
+
 function checkedProcessId(id) {
   if (typeof id !== "string" || !id || id === "." || id === ".." || /[^A-Za-z0-9._~-]/.test(id)) throw new Error("Invalid Mistral sign-in process ID")
   return encodeURIComponent(id)
@@ -418,7 +421,11 @@ async function pollSignIn(pollUrl, signal, base = consoleApi()) {
     { retries: SIGN_IN_TRIES }
   )
   if (res.status === 410) return { status: "expired" }
-  if (!res.ok) throw signInResponseError(res.status, `Mistral sign-in poll answered ${res.status}${why(text)}`)
+  if (!res.ok) {
+    const error = signInResponseError(res.status, `Mistral sign-in poll answered ${res.status}${why(text)}`)
+    if (res.status === 429) error.retryAfterMs = retryAfterMs(res.headers.get("retry-after"))
+    throw error
+  }
   return data
 }
 
@@ -437,7 +444,13 @@ async function exchangeSignIn(processId, exchangeToken, codeVerifier, signal, ba
     },
     { retries: SIGN_IN_TRIES }
   )
-  if (!res.ok) throw signInResponseError(res.status, `Mistral sign-in exchange failed (${res.status})${why(text)}`)
+  if (!res.ok) {
+    const errorData = parseJSON(text)
+    if (res.status === 403 && errorData?.error_code === 9004) {
+      throw new Error("This Mistral workspace is not eligible for Vibe (403/9004). Sign in again and choose a workspace with Vibe access.")
+    }
+    throw signInResponseError(res.status, `Mistral sign-in exchange failed (${res.status})${why(text, errorData)}`)
+  }
   if (!d?.api_key) throw new Error("Mistral sign-in exchange returned no API key")
   return d.api_key
 }
@@ -779,7 +792,7 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
               // link's own deadline. A 4xx that isn't 410 is the server
               // refusing the process, and asking again would only repeat it.
               let misses = 0
-              for (;;) {
+              while (Date.now() < deadline) {
                 let r
                 try {
                   r = await pollSignIn(p.poll_url, s, p.base)
@@ -787,9 +800,12 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
                 } catch (e) {
                   if (s?.aborted) throw e
                   if (!transient(e)) return { type: "failed", error: e?.message ?? String(e) }
-                  if (Date.now() > deadline) return { type: "failed", error: `Sign-in poll failed: ${e?.message ?? e}` }
                   misses++
-                  await sleep(Math.min(POLL_EVERY_MS * misses, 10_000), s)
+                  const wait = Math.max(Math.min(POLL_EVERY_MS * misses, 10_000), e.retryAfterMs ?? 0)
+                  if (wait >= deadline - Date.now()) {
+                    return { type: "failed", error: `Sign-in poll failed: ${e?.message ?? e}. Start sign-in again.` }
+                  }
+                  await sleep(wait, s)
                   continue
                 }
                 if (r?.status === "completed" && r.exchange_token) {
@@ -812,9 +828,10 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
                 if (r?.status === "expired") return { type: "failed", error: "The sign-in expired; start it again" }
                 if (r?.status === "denied") return { type: "failed", error: r.message || "The sign-in was denied" }
                 if (r?.status === "error") return { type: "failed", error: r.message || "The sign-in failed" }
-                if (Date.now() > deadline) return { type: "failed", error: "The sign-in timed out; start it again" }
-                await sleep(POLL_EVERY_MS, s)
+                await sleep(Math.min(POLL_EVERY_MS, Math.max(0, deadline - Date.now())), s)
               }
+              s?.throwIfAborted()
+              return { type: "failed", error: "The sign-in timed out; start it again" }
             },
           }
         },

@@ -850,9 +850,7 @@ test("a poll refusal that is not a rate limit or a 5xx ends the sign-in", async 
   expect(String(e.message)).toContain("404: unknown process")
 })
 
-// the loop over the poll: a 429 is asked again rather than reported, and a
-// 404 is the answer (the same stand-in answers both here)
-test("the sign-in's poll loop rides out a rate limit and gives up on a refusal", async () => {
+test("the sign-in resumes polling after a rate limit without Retry-After", async () => {
   const hooks = await plugin()
   const oauth = hooks.auth.methods.find((m) => m.type === "oauth")
   let polls = 0
@@ -880,6 +878,96 @@ test("the sign-in's poll loop rides out a rate limit and gives up on a refusal",
   expect(r.type).toBe("success")
   expect(r.key).toBe(KEY)
   expect(polls).toBe(2)
+})
+
+test.each(["seconds", "HTTP date"])("the sign-in honors Retry-After in %s before polling again", async (format) => {
+  mockFetch()
+  const fetch = globalThis.fetch
+  let polls = 0
+  let retryAt = 0
+  let resumedAt = 0
+  globalThis.fetch = async (input, init) => {
+    if (!String(input).endsWith("/poll/token-p1")) return fetch(input, init)
+    if (++polls === 1) {
+      const now = Date.now()
+      retryAt = format === "seconds" ? now + 2000 : Math.ceil((now + 2000) / 1000) * 1000
+      const value = format === "seconds" ? "2" : new Date(retryAt).toUTCString()
+      return Response.json({ detail: "slow down" }, { status: 429, headers: { "Retry-After": value } })
+    }
+    resumedAt = Date.now()
+    return Response.json({ status: "completed", exchange_token: "et-1" })
+  }
+
+  const oauth = (await plugin()).auth.methods.find((m) => m.type === "oauth")
+  const started = await oauth.authorize()
+  const result = await started.callback()
+
+  expect(result.type).toBe("success")
+  expect(polls).toBe(2)
+  expect(resumedAt).toBeGreaterThanOrEqual(retryAt - 10)
+})
+
+test("a Retry-After beyond link expiry ends sign-in without another poll", async () => {
+  mockFetch()
+  const fetch = globalThis.fetch
+  let polls = 0
+  globalThis.fetch = async (input, init) => {
+    if (!String(input).endsWith("/poll/token-p1")) return fetch(input, init)
+    polls++
+    return Response.json({ detail: "slow down" }, { status: 429, headers: { "Retry-After": "660" } })
+  }
+
+  const oauth = (await plugin()).auth.methods.find((m) => m.type === "oauth")
+  const started = await oauth.authorize()
+  const result = await started.callback()
+
+  expect(result.type).toBe("failed")
+  expect(result.error).toMatch(/429.*Start sign-in again/)
+  expect(polls).toBe(1)
+})
+
+test("an expired sign-in avoids polling and still honors cancellation", async () => {
+  mockFetch()
+  const fetch = globalThis.fetch
+  let requests = 0
+  globalThis.fetch = async (input, init) => {
+    requests++
+    const response = await fetch(input, init)
+    const started = await response.json()
+    return Response.json({ ...started, expires_at: new Date(Date.now() - 1000).toISOString() })
+  }
+
+  const oauth = (await plugin()).auth.methods.find((m) => m.type === "oauth")
+  const started = await oauth.authorize()
+  expect((await started.callback()).error).toContain("timed out")
+  await expect(started.callback(undefined, { signal: AbortSignal.abort() })).rejects.toHaveProperty("name", "AbortError")
+  expect(requests).toBe(1)
+})
+
+test.each([
+  [9004, "This Mistral workspace is not eligible for Vibe (403/9004)"],
+  [9005, "Mistral sign-in exchange failed (403): exchange refused"],
+])("exchange 403 with error code %d returns its login error without retrying", async (code, message) => {
+  mockFetch()
+  const fetch = globalThis.fetch
+  let exchanges = 0
+  globalThis.fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname
+    if (path.endsWith("/poll/token-p1")) return Response.json({ status: "completed", exchange_token: "et-1" })
+    if (path.endsWith("/exchange")) {
+      exchanges++
+      return Response.json({ error_code: code, detail: "exchange refused" }, { status: 403 })
+    }
+    return fetch(input, init)
+  }
+
+  const oauth = (await plugin()).auth.methods.find((m) => m.type === "oauth")
+  const started = await oauth.authorize()
+  const result = await started.callback()
+
+  expect(result.type).toBe("failed")
+  expect(result.error).toContain(message)
+  expect(exchanges).toBe(1)
 })
 
 test("the sign-in retries the exchange after a rate limit and a server error", async () => {

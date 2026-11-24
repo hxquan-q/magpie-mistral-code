@@ -1,7 +1,7 @@
 {
   "name": "@solary/magpie-mistral-vibe",
   "version": "0.2.0",
-  "description": "Mistral Vibe Code subscription as an OpenCode/magpie provider plugin (unofficial fork), with browser sign-in or a Vibe CLI key and plan, quota, and pay-as-you-go status in Magpie",
+  "description": "Unofficial Mistral Vibe Code provider for Magpie with browser sign-in, Vibe CLI keys, and plan and quota reporting",
   "type": "module",
   "main": "./opencode.mjs",
   "exports": {
@@ -26,7 +26,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/songlairui/magpie-mistral-code.git"
+    "url": "git+https://github.com/hxquan-q/magpie-mistral-code.git"
   },
   "magpie": {
     "name": "Mistral Vibe Code (unofficial)",
