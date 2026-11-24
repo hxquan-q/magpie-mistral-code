@@ -1,0 +1,118 @@
+{
+  "connections": [
+    {
+      "label": "Provider hooks",
+      "from": "host",
+      "id": "dispatch",
+      "to": "plugin"
+    },
+    {
+      "label": "HTTPS",
+      "from": "plugin",
+      "id": "inference",
+      "to": "api",
+      "labelAt": [
+        650,
+        108
+      ]
+    },
+    {
+      "label": "HTTPS",
+      "from": "plugin",
+      "id": "identity",
+      "to": "console",
+      "labelAt": [
+        650,
+        280
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "items": [
+        "校验目标后附加 Bearer，禁止自动重定向",
+        "流读完、报错或取消后释放名额"
+      ],
+      "dot": "cyan",
+      "title": "生成"
+    },
+    {
+      "items": [
+        "同账号同服务仅合并在途刷新"
+      ],
+      "dot": "emerald",
+      "title": "额度"
+    },
+    {
+      "items": [
+        "真实聊天成功；TCP 观测未解密 TLS"
+      ],
+      "dot": "rose",
+      "title": "验证"
+    }
+  ],
+  "schema_version": 1,
+  "components": [
+    {
+      "pos": [
+        30,
+        150
+      ],
+      "sublabel": "模型选择与宿主路由",
+      "label": "Magpie / OpenCode",
+      "type": "backend",
+      "size": [
+        185,
+        75
+      ],
+      "id": "host"
+    },
+    {
+      "pos": [
+        365,
+        150
+      ],
+      "sublabel": "目标校验 · 凭证 · 并发",
+      "label": "mistral-vibe 插件",
+      "type": "backend",
+      "size": [
+        200,
+        75
+      ],
+      "id": "plugin"
+    },
+    {
+      "pos": [
+        720,
+        75
+      ],
+      "sublabel": "生成 · 模型 · 计费",
+      "label": "Mistral API",
+      "type": "external",
+      "size": [
+        185,
+        75
+      ],
+      "id": "api"
+    },
+    {
+      "pos": [
+        720,
+        255
+      ],
+      "sublabel": "浏览器授权 · 账号身份",
+      "label": "Mistral Console",
+      "type": "external",
+      "size": [
+        185,
+        75
+      ],
+      "id": "console"
+    }
+  ],
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Magpie × Mistral Vibe 请求架构",
+    "output": "docs/architecture.html"
+  }
+}

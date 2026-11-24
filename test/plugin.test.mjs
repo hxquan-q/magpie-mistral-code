@@ -509,8 +509,7 @@ test("a body with nothing to move comes back untouched", () => {
 //   ECONNRESET: The socket connection was closed unexpectedly. For more
 //   information, pass verbose: true in the second argument to fetch()
 //
-// send() retries that one failure on a fresh connection: twice for a GET,
-// once for a POST (the error is raised before the request goes out).
+// Only read-only calls replay a transient failure.
 
 const resetError = () => {
   const e = new Error("ECONNRESET: The socket connection was closed unexpectedly. For more information, pass verbose: true in the second argument to fetch()")
@@ -518,7 +517,7 @@ const resetError = () => {
   return e
 }
 
-test("a stale pooled socket is retried once on a fresh connection", async () => {
+test("a generation POST is not replayed after reset", async () => {
   const { send } = _internal
   let calls = 0
   globalThis.fetch = async () => {
@@ -526,9 +525,8 @@ test("a stale pooled socket is retried once on a fresh connection", async () => 
     if (calls === 1) throw resetError()
     return new Response("ok")
   }
-  const res = await send("http://mock.local/v1/chat/completions", { method: "POST", body: "{}" })
-  expect(res.status).toBe(200)
-  expect(calls).toBe(2)
+  await expect(send("http://mock.local/v1/chat/completions", { method: "POST", body: "{}" })).rejects.toThrow(/ECONNRESET/)
+  expect(calls).toBe(1)
 })
 
 test("a GET retries twice, and a repeated failure still surfaces", async () => {
@@ -601,7 +599,7 @@ test("a stream body is sent once, never replayed", async () => {
   expect(calls).toBe(1)
 })
 
-test("a Request's body is replayed from a clone", async () => {
+test("a Request generation body is sent only once", async () => {
   const { send } = _internal
   const seen = []
   let calls = 0
@@ -612,10 +610,9 @@ test("a Request's body is replayed from a clone", async () => {
     return new Response("ok")
   }
   const req = new Request("http://mock.local/v1/chat/completions", { method: "POST", body: "{\"a\":1}" })
-  const res = await send(req)
-  expect(res.status).toBe(200)
-  expect(calls).toBe(2)
-  expect(seen).toEqual(["{\"a\":1}", "{\"a\":1}"])
+  await expect(send(req)).rejects.toThrow(/ECONNRESET/)
+  expect(calls).toBe(1)
+  expect(seen).toEqual(["{\"a\":1}"])
 })
 
 test("a refusal is drained so its connection goes back whole", async () => {
@@ -828,7 +825,7 @@ test("a reset while the sign-in polls or exchanges is retried", async () => {
     if (u.pathname.endsWith("/exchange")) return json({ api_key: KEY })
     return json({})
   }
-  expect((await pollSignIn("http://mock.local/api/vibe/sign-in/p9/poll")).exchange_token).toBe("et-2")
+  expect((await pollSignIn("http://mock.local/api/vibe/sign-in/p9/poll", "p9")).exchange_token).toBe("et-2")
   calls = 0
   expect(await exchangeSignIn("p9", "et-2", "verifier")).toBe(KEY)
   expect(calls).toBe(2)
@@ -839,7 +836,7 @@ test("the sign-in's failures carry what the console said", async () => {
   globalThis.fetch = async () =>
     new Response(JSON.stringify({ detail: "Too many sign-in attempts" }), { status: 429, headers: { "content-type": "application/json" } })
   await expect(startSignIn()).rejects.toThrow(/429\): Too many sign-in attempts/)
-  const e = await pollSignIn("http://mock.local/api/vibe/sign-in/p9/poll").catch((x) => x)
+  const e = await pollSignIn("http://mock.local/api/vibe/sign-in/p9/poll", "p9").catch((x) => x)
   expect(e.transient).toBe(true)
   expect(String(e.message)).toContain("Too many sign-in attempts")
 })
@@ -847,7 +844,7 @@ test("the sign-in's failures carry what the console said", async () => {
 test("a poll refusal that is not a rate limit or a 5xx ends the sign-in", async () => {
   const { pollSignIn } = _internal
   globalThis.fetch = async () => new Response(JSON.stringify({ detail: "unknown process" }), { status: 404 })
-  const e = await pollSignIn("http://mock.local/api/vibe/sign-in/p9/poll").catch((x) => x)
+  const e = await pollSignIn("http://mock.local/api/vibe/sign-in/p9/poll", "p9").catch((x) => x)
   expect(e.transient).toBeUndefined()
   expect(String(e.message)).toContain("404: unknown process")
 })
@@ -974,3 +971,81 @@ test("a callback signal that aborts ends the wait", async () => {
   expect(e).toBeTruthy()
   expect(e.name).toBe("AbortError")
 })
+
+
+test("loader pins Bearer to chat and forwards the original 429", async () => {
+  const loader = await (await plugin()).auth.loader(async () => ({ type: "api", key: KEY }))
+  let calls = 0
+  globalThis.fetch = async (_input, init) => {
+    calls++
+    expect(init.redirect).toBe("error")
+    expect(init.headers.get("user-agent")).toBe("magpie-mistral-vibe/0.2.0")
+    return new Response("limited", { status: 429, headers: { "retry-after": "0" } })
+  }
+  for (const url of ["http://other.local/v1/chat/completions", "http://mock.local/v1/models"]) {
+    await expect(loader.fetch(url)).rejects.toThrow(/Unexpected Mistral request target/)
+  }
+  const response = await loader.fetch("http://mock.local/v1/chat/completions", { method: "POST", redirect: "follow" })
+  expect(response.status).toBe(429)
+  expect(response.headers.get("retry-after")).toBe("0")
+  expect(calls).toBe(1)
+})
+
+test("quota refreshes share only active reads", async () => {
+  mockFetch()
+  const fetch = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = (...args) => { calls++; return fetch(...args) }
+  const usage = (await plugin()).auth.usage
+  const auth = async () => ({ type: "api", key: KEY })
+  await Promise.all([usage(auth), usage(auth)])
+  expect(calls).toBe(3)
+  await usage(auth)
+  expect(calls).toBe(6)
+})
+
+test("polling rejects a different origin and a different process", async () => {
+  globalThis.fetch = async () => { throw new Error("unexpected fetch") }
+  for (const url of ["http://other.local/api/vibe/sign-in/p9/poll", "http://mock.local/api/vibe/sign-in/p8/poll"]) {
+    await expect(_internal.pollSignIn(url, "p9")).rejects.toThrow(/Unexpected Mistral request target/)
+  }
+})
+
+
+for (const ending of ["cancel", "eof", "read error"]) {
+  test(`generation releases the queued request after ${ending}`, async () => {
+    const loader = await (await plugin()).auth.loader(async () => ({ type: "api", key: `fixture-stream-${ending}` }))
+    let sent = 0
+    let firstController
+    let upstreamCanceled = false
+    globalThis.fetch = async () => {
+      const ordinal = ++sent
+      return new Response(new ReadableStream({
+        start(controller) { if (ordinal === 1) firstController = controller },
+        cancel() { if (ordinal === 1) upstreamCanceled = true },
+      }))
+    }
+    const generate = () => loader.fetch("http://mock.local/v1/chat/completions", { method: "POST" })
+    const first = await Promise.all(Array.from({ length: 4 }, generate))
+    const fifth = generate()
+    await Promise.resolve()
+    expect(sent).toBe(4)
+    if (ending === "cancel") {
+      await first[0].body.cancel()
+      expect(upstreamCanceled).toBe(true)
+    } else {
+      const reader = first[0].body.getReader()
+      const read = reader.read()
+      if (ending === "eof") {
+        firstController.close()
+        expect((await read).done).toBe(true)
+      } else {
+        firstController.error(new Error("fixture read failed"))
+        await expect(read).rejects.toThrow("fixture read failed")
+      }
+    }
+    const last = await fifth
+    expect(sent).toBe(5)
+    await Promise.all([...first.slice(1), last].map((res) => res.body.cancel()))
+  })
+}

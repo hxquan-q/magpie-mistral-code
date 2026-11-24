@@ -30,8 +30,15 @@ const ID = "mistral-vibe"
 
 // bases are functions so tests can point them at a stand-in with the
 // MISTRAL_VIBE_API_BASE / MISTRAL_VIBE_CONSOLE_API environment variables
-const apiBase = () => (process.env.MISTRAL_VIBE_API_BASE || "https://api.mistral.ai/v1").replace(/\/+$/, "")
-const consoleApi = () => (process.env.MISTRAL_VIBE_CONSOLE_API || "https://console.mistral.ai/api").replace(/\/+$/, "")
+function serviceBase(value) {
+  const url = new URL(value)
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error("Invalid Mistral service base")
+  }
+  return url.href.replace(/\/+$/, "")
+}
+const apiBase = () => serviceBase(process.env.MISTRAL_VIBE_API_BASE || "https://api.mistral.ai/v1")
+const consoleApi = () => serviceBase(process.env.MISTRAL_VIBE_CONSOLE_API || "https://console.mistral.ai/api")
 
 const POLL_EVERY_MS = 1500
 const SIGN_IN_TTL_MS = 10 * 60 * 1000
@@ -78,6 +85,116 @@ const sleep = (ms, signal) =>
   })
 
 const keyOf = (auth) => (auth?.type === "api" || auth?.key ? auth.key : auth?.access) || ""
+
+// A Vibe plan is sized for one interactive CLI; magpie can put several
+// agents behind the same key at once. The gate keeps that fan-out from
+// reading as a burst: at most MISTRAL_VIBE_MAX_CONCURRENCY requests in flight
+// per key, started at least MISTRAL_VIBE_MIN_INTERVAL_MS apart. One gate per
+// key, so separate accounts never queue behind each other.
+const MAX_INFLIGHT = Math.max(1, Number(process.env.MISTRAL_VIBE_MAX_CONCURRENCY) || 4)
+const interval = Number(process.env.MISTRAL_VIBE_MIN_INTERVAL_MS?.trim() || 250)
+const MIN_INTERVAL_MS = Number.isFinite(interval) && interval >= 0 ? interval : 250
+const gates = new Map()
+function gateOf(key) {
+  let g = gates.get(key)
+  if (!g) {
+    g = { active: 0, lastStart: -Infinity, pacing: Promise.resolve(), queue: [] }
+    gates.set(key, g)
+  }
+  return g
+}
+async function acquire(g, signal) {
+  if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError")
+  if (g.active >= MAX_INFLIGHT) {
+    await new Promise((resolve, reject) => {
+      const start = () => {
+        signal?.removeEventListener("abort", onAbort)
+        g.active += 1
+        resolve()
+      }
+      const onAbort = () => {
+        const i = g.queue.indexOf(start)
+        if (i >= 0) g.queue.splice(i, 1)
+        reject(signal.reason ?? new DOMException("Aborted", "AbortError"))
+      }
+      g.queue.push(start)
+      signal?.addEventListener("abort", onAbort, { once: true })
+    })
+  } else {
+    g.active += 1
+  }
+
+}
+function pace(g, signal, start) {
+  let response
+  const dispatch = g.pacing.then(async () => {
+    const wait = g.lastStart + MIN_INTERVAL_MS - performance.now()
+    if (wait > 0) await sleep(Math.ceil(wait), signal)
+    signal?.throwIfAborted()
+    g.lastStart = performance.now()
+    response = Promise.resolve(start())
+    // Observe rejection immediately without holding the pacing queue for headers.
+    response.catch(() => {})
+  })
+  g.pacing = dispatch.catch(() => {})
+  return dispatch.then(() => response)
+}
+function release(g) {
+  g.active = Math.max(0, g.active - 1)
+  const next = g.queue.shift()
+  if (next) next()
+}
+async function withGate(key, signal, fn) {
+  const g = gateOf(key)
+  await acquire(g, signal)
+  const start = () => {
+    signal?.throwIfAborted()
+    return fn()
+  }
+  let done = false
+  const finish = () => {
+    if (done) return
+    done = true
+    signal?.removeEventListener("abort", onAbort)
+    release(g)
+  }
+  let reader
+  const onAbort = () => {
+    finish()
+    void reader?.cancel(signal.reason).catch(() => {})
+  }
+  try {
+    const response = await (MIN_INTERVAL_MS === 0 ? start() : pace(g, signal, start))
+    if (!response.body || !response.ok) {
+      finish()
+      return response
+    }
+    reader = response.body.getReader()
+    signal?.addEventListener("abort", onAbort, { once: true })
+    if (signal?.aborted) onAbort()
+    const body = new ReadableStream({
+      async pull(controller) {
+        try {
+          const chunk = await reader.read()
+          if (signal?.aborted) throw signal.reason
+          if (chunk.done) { finish(); controller.close() }
+          else controller.enqueue(chunk.value)
+        } catch (error) {
+          finish()
+          controller.error(error)
+        }
+      },
+      cancel(reason) {
+        finish()
+        return reader.cancel(reason)
+      },
+    }, { highWaterMark: 0 })
+    return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers })
+  } catch (error) {
+    finish()
+    throw error
+  }
+}
 
 // ---- transport ----------------------------------------------------------
 //
@@ -158,36 +275,17 @@ const READ_TRIES = 2
 const SIGN_IN_TRIES = 3
 const retryDelay = (attempt) => RETRY_MS * (attempt + 1) + Math.floor(Math.random() * 100)
 
-// send is fetch with the stale-socket retry: a GET or HEAD twice, a POST once.
-// A body that is a string, a Buffer or a Blob goes out again as it is; a
-// Request's body is cloned ahead of the first send, because fetch spends it.
-// A ReadableStream body is the one thing that can't be replayed, so that
-// request is sent once and its error surfaces — and so is a Request whose
-// body was locked before the clone, which would otherwise go out a second
-// time with nothing left to send.
-async function send(input, init = {}, { retries } = {}) {
+// Only read-only methods can be replayed after a transport failure.
+async function send(input, init = {}) {
   const method = String(init.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase()
-  const idempotent = method === "GET" || method === "HEAD" || method === "OPTIONS"
-  const req = input instanceof Request ? input : null
-  const streamed = init.body && typeof init.body === "object" && typeof init.body.getReader === "function"
-  // the spare is taken before the first send consumes the original; an
-  // init.body replaces the Request's own, so the spare only stands in when
-  // there isn't one
-  let spare = null
-  if (req?.body && init.body === undefined) {
-    try {
-      spare = req.clone()
-    } catch {}
-  }
-  const replayable = !streamed && (!req?.body || init.body !== undefined || spare !== null)
-  const budget = replayable ? retries ?? (idempotent ? 2 : 1) : 0
+  const signal = init.signal ?? (input instanceof Request ? input.signal : undefined)
+  const budget = ["GET", "HEAD", "OPTIONS"].includes(method) ? READ_TRIES : 0
   for (let attempt = 0; ; attempt++) {
-    const arg = attempt > 0 && spare ? spare : input
     try {
-      return await fetch(arg, init)
+      return await fetch(input, init)
     } catch (e) {
-      if (init.signal?.aborted || attempt >= budget || !staleSocket(e)) throw e
-      await sleep(retryDelay(attempt), init.signal)
+      if (signal?.aborted || attempt >= budget || !staleSocket(e)) throw e
+      await sleep(retryDelay(attempt), signal)
     }
   }
 }
@@ -203,7 +301,7 @@ async function send(input, init = {}, { retries } = {}) {
 async function readJSON(url, init = {}, { retries = READ_TRIES } = {}) {
   for (let attempt = 0; ; attempt++) {
     try {
-      const res = await send(url, init, { retries: 0 })
+      const res = await fetch(url, init)
       if (!res.ok) {
         // a refusal's body is the server's own explanation of it; it is read
         // once, kept for the error message, and the connection goes back whole
@@ -242,25 +340,20 @@ function why(text) {
 const newVerifier = () => randomBytes(48).toString("base64url")
 const challengeOf = (verifier) => createHash("sha256").update(verifier).digest("base64url")
 
-// UA is the client identity the official CLI sends (mistral-vibe
-// vibe/utils/http.py: get_user_agent). console.mistral.ai sits behind
-// Cloudflare, and the sign-in endpoints are the ones it is most particular
-// about: a request that names a bare runtime (`Bun/1.2.21`) is the one that
-// gets a connection dropped under it, which is what a login that never
-// finishes looks like. The same identity goes on every console and API call.
-const UA = () => process.env.MISTRAL_VIBE_UA || "mistral-client-python/Mistral-Vibe/3.1.3"
+const UA = () => "magpie-mistral-vibe/0.2.0"
 
-// consoleHeaders are the sign-in calls' headers: the CLI's identity, and no
-// keep-alive reuse — these are three one-shot calls in a row, and a
-// connection the pool kept from the last one is exactly what Cloudflare has
-// already closed by the time the next is written.
-function consoleHeaders(extra = {}) {
-  return {
-    accept: "application/json",
-    "user-agent": UA(),
-    connection: "close",
-    ...extra,
+function checkedTarget(input, expected) {
+  const actual = new URL(input instanceof Request ? input.url : input)
+  const target = new URL(expected)
+  if (!["http:", "https:"].includes(actual.protocol) || actual.origin !== target.origin ||
+      actual.pathname !== target.pathname || actual.username || actual.password || actual.hash) {
+    throw new Error("Unexpected Mistral request target")
   }
+  return actual.href
+}
+
+function consoleHeaders(extra = {}) {
+  return { accept: "application/json", "user-agent": UA(), ...extra }
 }
 
 // withTimeout gives a call its own deadline beside the caller's: whichever
@@ -272,15 +365,17 @@ function withTimeout(signal, ms) {
 }
 
 async function startSignIn(signal) {
+  const base = consoleApi()
   const code_verifier = newVerifier()
   // readJSON, not send: the payload comes back in the body, and a reset that
   // lands between the headers and the body is the same dead socket one step
   // later. A second start on a fresh connection is harmless — the process it
   // leaves unused expires on its own.
   const { res, data: d, text } = await readJSON(
-    `${consoleApi()}/vibe/sign-in`,
+    `${base}/vibe/sign-in`,
     {
       method: "POST",
+      redirect: "error",
       headers: consoleHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ code_challenge: challengeOf(code_verifier), code_challenge_method: "S256" }),
       // a start that hangs is retried by the deadline, not waited on forever
@@ -290,7 +385,8 @@ async function startSignIn(signal) {
   )
   if (!res.ok) throw new Error(`Mistral sign-in could not start (${res.status})${why(text)}`)
   if (!d?.process_id || !d?.sign_in_url || !d?.poll_url) throw new Error("Mistral sign-in answered an unexpected payload")
-  return { process_id: d.process_id, sign_in_url: d.sign_in_url, poll_url: d.poll_url, expires_at: d.expires_at, code_verifier }
+  checkedTarget(d.poll_url, signInEndpoint(base, d.process_id, "poll"))
+  return { base, process_id: d.process_id, sign_in_url: d.sign_in_url, poll_url: d.poll_url, expires_at: d.expires_at, code_verifier }
 }
 
 function signInResponseError(status, message) {
@@ -299,10 +395,15 @@ function signInResponseError(status, message) {
   return error
 }
 
-async function pollSignIn(pollUrl, signal) {
+function signInEndpoint(base, id, action) {
+  if (typeof id !== "string" || !id || id === "." || id === ".." || /[^A-Za-z0-9._~-]/.test(id)) throw new Error("Invalid Mistral sign-in process ID")
+  return `${base}/vibe/sign-in/${encodeURIComponent(id)}/${action}`
+}
+
+async function pollSignIn(pollUrl, processId, signal, base = consoleApi()) {
   const { res, data, text } = await readJSON(
-    pollUrl,
-    { headers: consoleHeaders(), signal: withTimeout(signal, SIGN_IN_CALL_MS) },
+    checkedTarget(pollUrl, signInEndpoint(base, processId, "poll")),
+    { redirect: "error", headers: consoleHeaders(), signal: withTimeout(signal, SIGN_IN_CALL_MS) },
     { retries: SIGN_IN_TRIES }
   )
   if (res.status === 410) return { status: "expired" }
@@ -310,14 +411,15 @@ async function pollSignIn(pollUrl, signal) {
   return data
 }
 
-async function exchangeSignIn(processId, exchangeToken, codeVerifier, signal) {
+async function exchangeSignIn(processId, exchangeToken, codeVerifier, signal, base = consoleApi()) {
   // an exchange repeats on the same token, so a stale socket is safe to
   // retry here too: the server either hands out the key or has already
   // spent the token, and the second answer is the real one
   const { res, data: d, text } = await readJSON(
-    `${consoleApi()}/vibe/sign-in/${encodeURIComponent(processId)}/exchange`,
+    signInEndpoint(base, processId, "exchange"),
     {
       method: "POST",
+      redirect: "error",
       headers: consoleHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ exchange_token: exchangeToken, code_verifier: codeVerifier }),
       signal: withTimeout(signal, SIGN_IN_CALL_MS),
@@ -330,8 +432,9 @@ async function exchangeSignIn(processId, exchangeToken, codeVerifier, signal) {
 }
 
 // whoami names the plan behind a key (console.mistral.ai/api/vibe/whoami)
-async function whoami(key) {
-  const { res, data } = await readJSON(`${consoleApi()}/vibe/whoami`, {
+async function whoami(key, base = consoleApi()) {
+  const { res, data } = await readJSON(`${base}/vibe/whoami`, {
+    redirect: "error",
     headers: consoleHeaders({ Authorization: `Bearer ${key}` }),
     signal: AbortSignal.timeout(8000),
   })
@@ -395,7 +498,8 @@ function priceOf(m, dev) {
 
 async function listModels(key) {
   const { res, data: j } = await readJSON(`${apiBase()}/models`, {
-    headers: { Authorization: `Bearer ${key}` },
+    redirect: "error",
+    headers: { Authorization: `Bearer ${key}`, "user-agent": UA() },
     signal: AbortSignal.timeout(15_000),
   })
   if (!res.ok) return null
@@ -454,16 +558,27 @@ async function listModels(key) {
 
 // ---- usage: the billing reads (vibe's app_server/_billing.py) ----
 
-async function readUsage(key) {
-  const headers = { Authorization: `Bearer ${key}` }
+const usageInFlight = new Map()
+function refreshUsage(key) {
+  const base = apiBase()
+  const consoleBase = consoleApi()
+  const id = JSON.stringify([base, consoleBase, key])
+  if (usageInFlight.has(id)) return usageInFlight.get(id)
+  const pending = readUsage(key, base, consoleBase).finally(() => usageInFlight.delete(id))
+  usageInFlight.set(id, pending)
+  return pending
+}
+
+async function readUsage(key, base = apiBase(), consoleBase = consoleApi()) {
+  const headers = { Authorization: `Bearer ${key}`, "user-agent": UA() }
   const ask = async (url) => {
-    const { res, data } = await readJSON(url, { headers, signal: AbortSignal.timeout(8000) })
+    const { res, data } = await readJSON(url, { headers, redirect: "error", signal: AbortSignal.timeout(8000) })
     return res.ok ? data : null
   }
   const [subscription, budget, who] = (await Promise.allSettled([
-    ask(`${apiBase()}/billing/subscription`),
-    ask(`${apiBase()}/billing/budget`),
-    whoami(key),
+    ask(`${base}/billing/subscription`),
+    ask(`${base}/billing/budget`),
+    whoami(key, consoleBase),
   ])).map((read) => read.status === "fulfilled" ? read.value : null)
   const identity = accountIdentity(who)
   const vb = budget?.vibe_budget
@@ -608,27 +723,27 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
     usage: async (getAuth) => {
       const key = keyOf(await getAuth())
       if (!key) return { error: "Not signed in", windows: [] }
-      return readUsage(key)
+      return refreshUsage(key)
     },
     loader: async (getAuth) => {
       const auth = await getAuth()
       const key = keyOf(auth)
       if (!key) return {}
+      const base = apiBase()
       return {
-        baseURL: apiBase(),
+        baseURL: base,
         apiKey: "mistral-vibe", // the engine's placeholder; the fetch below signs
         async fetch(input, init = {}) {
+          const target = checkedTarget(input, `${base}/chat/completions`)
           const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined))
           headers.set("Authorization", `Bearer ${key}`)
-          // 与官方 CLI 一致的客户端标识（mistral-vibe vibe/utils/http.py: get_user_agent）
-          if (!headers.has("user-agent")) headers.set("user-agent", process.env.MISTRAL_VIBE_UA || "mistral-client-python/Mistral-Vibe/3.1.3")
+          headers.set("User-Agent", UA())
           const body = mistralBody(init.body)
-          if (body !== init.body) {
-            // the length the engine counted is not the one sent
-            headers.delete("content-length")
-            return send(input, { ...init, headers, body })
-          }
-          return send(input, { ...init, headers })
+          if (body !== init.body) headers.delete("content-length")
+          const signal = init.signal ?? (input instanceof Request ? input.signal : undefined)
+          return withGate(JSON.stringify([base, key]), signal, () => send(input instanceof Request ? input : target, {
+            ...init, headers, redirect: "error", ...(body !== init.body ? { body } : {}),
+          }))
         },
       }
     },
@@ -656,7 +771,7 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
               for (;;) {
                 let r
                 try {
-                  r = await pollSignIn(p.poll_url, s)
+                  r = await pollSignIn(p.poll_url, p.process_id, s, p.base)
                   misses = 0
                 } catch (e) {
                   if (s?.aborted) throw e
@@ -672,8 +787,8 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
                   // away: the user's browser round trip is not spent twice
                   for (;;) {
                     try {
-                      const key = await exchangeSignIn(p.process_id, r.exchange_token, p.code_verifier, s)
-                      const who = await whoami(key).catch(() => null)
+                      const key = await exchangeSignIn(p.process_id, r.exchange_token, p.code_verifier, s, p.base)
+                      const who = await whoami(key, p.base).catch(() => null)
                       const out = { type: "success", key, metadata: { plan: accountIdentity(who).plan, vibeEntitlement: who?.has_paid_vibe_entitlement } }
                       if (who?.customer_id != null) out.accountId = String(who.customer_id)
                       return out

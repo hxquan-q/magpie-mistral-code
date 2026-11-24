@@ -6,6 +6,16 @@
 
 ---
 
+## 项目来源
+
+本插件由 [hxquan-q](https://github.com/hxquan-q) 自行开发和维护，代码发布在 [hxquan-q/magpie-mistral-code](https://github.com/hxquan-q/magpie-mistral-code)。开发过程中参考了 [songlairui/magpie-mistral-code](https://github.com/songlairui/magpie-mistral-code) 的实现思路；它是参考项目，并非本仓库的上游。
+
+## 项目用途
+
+这是一个用于学习和个人使用的接入项目：把你自己的 **Mistral Vibe Code 订阅**接入 Magpie 或 OpenCode，让 Claude Code、Codex 等 Agent 可以通过宿主调用该订阅可用的模型。项目也用于学习 Provider 插件如何处理授权、流式响应与额度展示。
+
+插件只做接口适配，不提供订阅、共享账号或额外额度，也不以绕过服务限制为目的。请使用自己的账号和凭证，按套餐适用范围使用；请勿用于账号共享、转售、批量滥用或规避限流。第三方 Agent 能发起请求，不代表 Mistral 官方支持该接入；实际可用模型、额度和计费以服务方为准。
+
 ## 为什么需要它
 
 Vibe Code 会先使用套餐包含的月度额度。每个组织的额度和超额付费设置由 Mistral 管理，实际扣账可在 Mistral 的用量页面核对。 [Mistral 订阅说明](https://docs.mistral.ai/admin/billing-usage/subscriptions)
@@ -17,7 +27,10 @@ magpie plugin add github:hxquan-q/magpie-mistral-code
 magpie plugin login mistral-vibe          # 浏览器登录；窗口别关，链接出现后立刻点
 ```
 
-装完在 agent 里挑 `mistral-vibe/<模型>` 即可。
+装完在 agent 里选择 `mistral-vibe/<模型>`。已安装时，用 `magpie plugin list` 核对启用项及插件路径，再运行 `magpie provider test mistral-vibe` 验证聊天（会发送真实请求，可能计入用量）。列表显示已启用并不代表已打开的桌面会话重新加载了代码。
+
+- [架构、登录／生成／额度流程与验证记录](docs/architecture.md)
+- [交互架构图（下载后用浏览器打开）](docs/architecture.html)
 
 ## 登录与套餐确认
 
@@ -56,13 +69,33 @@ magpie quota mistral-vibe --json
 | --- | --- |
 | `MISTRAL_VIBE_API_BASE` | 覆盖 LLM 基址（默认 `https://api.mistral.ai/v1`） |
 | `MISTRAL_VIBE_CONSOLE_API` | 覆盖 console API 基址（默认 `https://console.mistral.ai/api`） |
-| `MISTRAL_VIBE_UA` | 覆盖出站 User-Agent（默认 `mistral-client-python/Mistral-Vibe/3.1.3`） |
+| `MISTRAL_VIBE_MAX_CONCURRENCY` | 同一 key 的最大在途请求数（默认 4），用于避免多 agent 并发形成突发流量 |
+| `MISTRAL_VIBE_MIN_INTERVAL_MS` | 同一 key 两次请求开始的最小间隔（默认 250ms；设为 `0` 关闭） |
 
-## 请求适配（为什么能直连）
+## 实现思路与架构流程
+
+插件是宿主与 Mistral 之间的适配层，不运行模型。登录取得凭证，生成和额度分别使用各自的接口，额度查询不阻塞聊天请求。
+
+```mermaid
+flowchart LR
+    U[用户 / Agent] --> H[Magpie 或 OpenCode]
+    H -->|登录、生成、额度| P[mistral-vibe 插件]
+    P -->|浏览器授权、轮询、换取 Key| C[Mistral Console]
+    P -->|校验目标、排队、适配请求| A[Mistral API]
+    A -->|流式响应或错误| P
+    P -->|转发响应| H
+    P -->|查询套餐和预算| A
+    P -->|核对账户身份| C
+```
+
+- **登录**：浏览器授权使用 PKCE，完成后兑换 Vibe Key；也可在宿主手动输入 Vibe CLI Key。
+- **生成**：校验目标并取得发车名额后再出站。流结束、报错或取消才释放并发名额；遇到限流，由宿主决定如何处理。
+- **额度**：把套餐、预算与账号身份合并成宿主可展示的数据。只共享同一账号和服务的在途刷新，下一次独立刷新重新读取。
+
 
 agent 回传历史时会带 `reasoning_content` / `reasoning` / `reasoning_details`，而 Mistral 对未知字段返回 `422 Extra inputs are not permitted`。插件把这些思考内容改写成 Mistral 的 typed content part（thinking 块）放到该轮文本之前，因此带思考轮的会话不会中断。
 
-出站请求的 `User-Agent` 与官方客户端一致：`mistral-client-python/Mistral-Vibe/3.1.3`（对应 Vibe Desktop 1.2.0 内置的 `mistral_vibe-3.1.3`）。
+出站请求以 `magpie-mistral-vibe/0.2.0` 标识插件。聊天 Bearer 仅发送到配置的 API 同源 `/chat/completions` 路径，有凭证的请求不跟随重定向。生成 POST 遇到连接中断不自动重放，429 和 `Retry-After` 原样交给宿主。成功响应的并发名额保留到响应体结束、取消或出错。相同服务和凭证的额度请求只合并在途刷新，不缓存结果。
 
 ## 排错
 
@@ -75,18 +108,20 @@ agent 回传历史时会带 `reasoning_content` / `reasoning` / `reasoning_detai
 | `Studio API key` | 用浏览器重新登录，或换成在 `Code > Vibe CLI` 创建的 Key |
 | 模型列表为空 | 未登录成功；先 `magpie plugin list --json` 看 `signedIn` |
 
-## 关于风控
+## 隐私
 
-个人自用（单账号、单 key、交互式使用）在应用层与官方 CLI 一致：端点、鉴权方式、请求体语义、模型 id、User-Agent 全部对齐。建议避免：
+- **模型请求**：发送给配置的 Mistral API，包括生成所需的提示词、对话历史、工具数据，以及请求中附带的文件或图片内容。请在发送前移除不需要的敏感信息。
+- **凭证与账户**：凭证由宿主管理。插件使用凭证进行生成、模型列表、额度及身份查询；不要把 Key、授权链接或完整请求日志贴进公开 Issue。
+- **网络与第三方**：浏览器授权和身份查询访问 Mistral Console；模型目录可向 `models.dev` 查询公开模型元数据。代理和自定义基址会改变网络路径或数据接收方，请只使用信任的配置。数据保留及处理以各服务的隐私条款为准。
 
-- 高并发/批量化调用（套餐有 fair-use 条款，先兆通常是限速而非封禁）
-- 在同一订阅上轮换多个 key（会被看作 key farming）
-- 频繁重复登录（登录端点有频率统计）
+## 免责声明
+
+这是独立开发的非官方插件，不代表 Mistral AI 或 Magpie。接口、套餐权益、额度、计费及访问限制由服务方决定，可能变更。插件展示的额度和费用不替代官方账单；使用前请核对当前套餐、超额付费设置及适用条款。软件按 MIT 许可证提供，详见下方许可证。
 
 ## 致谢
 
-本 fork 增加了套餐身份确认、额度与 PAYG 状态展示、客户端 UA 对齐，以及失效 keep-alive 连接的重试。 [上游仓库](https://github.com/songlairui/magpie-mistral-code)
-
+- 感谢 [songlairui/magpie-mistral-code](https://github.com/songlairui/magpie-mistral-code) 提供实现参考。
+- 感谢 [LINUX DO](https://linux.do/) 社区的技术交流与分享。
 ## License
 
 MIT，见 [LICENSE](LICENSE)。Mistral、Vibe 等名称与商标归 Mistral AI 所有。
