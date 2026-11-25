@@ -56,12 +56,14 @@ magpie quota mistral-vibe --json
 | 额度页显示 `Budget unavailable` 或 `No monthly budget` | 前者表示没有可展示的预算，可刷新额度页。后者表示 Mistral 返回的月度额度为零，可到 Console 核对工作区。 |
 | 多轮对话收到 `422 extra_forbidden` | 运行 `magpie plugin list`，核对当前启用的插件及其路径。旧会话若仍加载旧代码，可在当前任务结束后重启 Magpie。 |
 | 模型列表为空 | 确认账号已登录，再运行 `magpie provider models mistral-vibe`。模型列表由 Mistral API 返回。 |
+| 消耗的是 Platform API credits 而非月度 Vibe 额度 | 确认插件为最新版本。计费由请求体的 `metadata.call_source` 决定，旧版本未注入该字段。更新后重启 Magpie 再发一条消息，核对 `vibe_budget` 是否增长。 |
 
 ## 工作原理
 
 - **登录**。通过 PKCE 发起浏览器授权，轮询 Mistral Console 提供的同源地址，完成后换取 Vibe Key，由 Magpie 保存。轮询遵循 `Retry-After`，换钥会重试临时网络错误、`429` 和 `5xx`。
 - **用量**。通过 `/vibe/whoami` 识别账号套餐，再用 `billing/budget` 的 Vibe 预算展示月度用量。超额付费状态优先读取预算中的开关，再查询订阅接口。
 - **聊天**。确认目标是配置的 `/chat/completions` 后，插件带上账号 Key 发送请求。它会清理宿主私有字段，将历史思考转换为 `thinking` 片段，并保留工具调用和结果的关联。请求按 API 基址和 Key 控制并发及发送间隔，生成接口的 `429` 和 `Retry-After` 交给 Magpie 处理。
+- **计费路由**。Mistral 按请求体的 `metadata.call_source` 选择计费池：官方 Vibe CLI 每次调用都带 `call_source: "vibe_code"`，计入套餐月度 Vibe 额度；缺失该字段的调用会计入 Platform API credits。插件复刻了 CLI 的完整 telemetry metadata（含 `call_type`、`client_version`、`os`、`arch` 等），使请求与官方 CLI 不可区分，从而正确计入月度 Vibe 额度。该机制逆向自 `mistral-vibe` CLI 的 `vibe/core/telemetry/build_metadata.py`，并经对照实验验证（带 metadata 时 `vibe_budget` 增长、`api_budget` 不动）。
 
 生成请求会把提示词、对话历史、工具数据和随请求发送的附件传给配置的 Mistral API。授权和身份查询访问 Mistral Console，公开模型元数据可从 `models.dev` 获取。 [查看插件实现](index.mjs)
 

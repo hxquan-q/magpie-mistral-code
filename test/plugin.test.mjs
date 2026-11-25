@@ -231,7 +231,7 @@ test("usage identifies a pasted Studio key without presenting Vibe allowance as 
   const u = await hooks.auth.usage(async () => ({ type: "api", key: "studio-key" }))
   expect(u.plan).toBe("Mistral Studio API")
   expect(u.windows).toEqual([
-    { name: "Vibe Code account", display: "Studio API key. Create a Vibe CLI key under Code > Vibe CLI.", aside: true },
+    { name: "Vibe Code account", display: "Studio API key: calls bill the $15 Platform API credits, not the monthly Vibe Code budget. Sign in with the browser (or paste a key from Code > Vibe CLI) to use the monthly budget.", aside: true },
     { name: "Platform API credits", used: 10, amount: 5, limit: 50, unit: "EUR", aside: true, resetsAt: undefined, span: 30 * 86400 },
   ])
 })
@@ -484,12 +484,28 @@ test("an earlier turn's thinking goes in the typed part Mistral takes", () => {
   expect(o.messages[2]).toEqual({ role: "assistant", content: "cut" })
 })
 
-// a body with no thinking, or not a chat request's JSON, comes back byte for
-// byte: every other request keeps its bytes on the way
-test("a body with nothing to move comes back untouched", () => {
+// a chat request picks up the vibe billing metadata: api.mistral.ai reads
+// metadata.call_source to bill the monthly Vibe Code budget over Platform API
+// credits. A body that isn't a chat request's JSON comes back byte for byte.
+test("a chat request carries the vibe billing metadata; other bodies keep their bytes", () => {
   const { mistralBody } = _internal
   const plain = JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] })
-  expect(mistralBody(plain)).toBe(plain)
+  const out = JSON.parse(mistralBody(plain))
+  expect(out.messages).toEqual([{ role: "user", content: "hi" }])
+  expect(out.metadata).toEqual({
+    call_source: "vibe_code",
+    call_type: "main_call",
+    client_name: "mistral-vibe",
+    client_version: "3.1.3",
+    version: "3.1.3",
+    os: "windows",
+    arch: "amd64",
+  })
+  // a caller's own metadata rides along, but call_source stays vibe_code
+  const own = JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }], metadata: { session_id: "s-1" } })
+  const ownOut = JSON.parse(mistralBody(own))
+  expect(ownOut.metadata.call_source).toBe("vibe_code")
+  expect(ownOut.metadata.session_id).toBe("s-1")
   const prefill = JSON.stringify({
     model: "m",
     messages: [{ role: "assistant", content: "The answer is", prefix: true, reasoning_content: "think" }],
@@ -880,6 +896,87 @@ test("the sign-in resumes polling after a rate limit without Retry-After", async
   expect(polls).toBe(2)
 })
 
+test("the browser sign-in speaks as the official client on a closed connection", async () => {
+  mockFetch()
+  const fetch = globalThis.fetch
+  const seen = []
+  globalThis.fetch = async (input, init) => {
+    if (String(input).includes("/api/vibe/")) {
+      const h = new Headers(init?.headers)
+      seen.push({ ua: h.get("user-agent"), conn: h.get("connection") })
+    }
+    return fetch(input, init)
+  }
+  const oauth = (await plugin()).auth.methods.find((m) => m.type === "oauth")
+  const started = await oauth.authorize()
+  expect((await started.callback()).type).toBe("success")
+  expect(seen.length).toBeGreaterThan(0)
+  for (const req of seen) {
+    expect(req.ua).toBe("mistral-client-python/Mistral-Vibe/3.1.3")
+    expect(req.conn).toBe("close")
+  }
+})
+
+test("the browser sign-in gives up after six consecutive 429s", async () => {
+  process.env.MISTRAL_VIBE_POLL_MS = "5"
+  let polls = 0
+  globalThis.fetch = async (input) => {
+    const u = new URL(String(input))
+    if (u.pathname === "/api/vibe/sign-in")
+      return Response.json({
+        process_id: "p-429",
+        sign_in_url: "https://console.mistral.ai/login?process=p-429",
+        poll_url: "http://mock.local/api/vibe/sign-in/poll/token-429",
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+      })
+    if (u.pathname === "/api/vibe/sign-in/poll/token-429") {
+      polls++
+      return Response.json({ detail: "Too many requests. Retry later." }, { status: 429, headers: { "retry-after": "0" } })
+    }
+    return Response.json({}, { status: 404 })
+  }
+  const oauth = (await plugin()).auth.methods.find((m) => m.type === "oauth")
+  const started = await oauth.authorize()
+  const r = await started.callback()
+  delete process.env.MISTRAL_VIBE_POLL_MS
+  expect(r.type).toBe("failed")
+  expect(r.error).toContain("rate-limited (429)")
+  expect(polls).toBe(6)
+})
+
+test("the sign-in exchange gives up after six consecutive 429s", async () => {
+  process.env.MISTRAL_VIBE_POLL_MS = "5"
+  try {
+    let exchanges = 0
+    globalThis.fetch = async (input) => {
+      const u = new URL(String(input))
+      if (u.pathname === "/api/vibe/sign-in")
+        return Response.json({
+          process_id: "p-429x",
+          sign_in_url: "https://console.mistral.ai/login?process=p-429x",
+          poll_url: "http://mock.local/api/vibe/sign-in/poll/token-429x",
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
+        })
+      if (u.pathname === "/api/vibe/sign-in/poll/token-429x")
+        return Response.json({ status: "completed", exchange_token: "exchange-429" })
+      if (u.pathname === "/api/vibe/sign-in/p-429x/exchange") {
+        exchanges++
+        return Response.json({ detail: "Too many requests. Retry later." }, { status: 429, headers: { "retry-after": "0" } })
+      }
+      return Response.json({}, { status: 404 })
+    }
+    const oauth = (await plugin()).auth.methods.find((m) => m.type === "oauth")
+    const started = await oauth.authorize()
+    const r = await started.callback()
+    expect(r.type).toBe("failed")
+    expect(r.error).toContain("exchange rate-limited (429)")
+    expect(r.error).toContain("Switch the proxy node")
+    expect(exchanges).toBe(6)
+  } finally {
+    delete process.env.MISTRAL_VIBE_POLL_MS
+  }
+})
+
 test.each(["seconds", "HTTP date"])("the sign-in honors Retry-After in %s before polling again", async (format) => {
   mockFetch()
   const fetch = globalThis.fetch
@@ -1068,7 +1165,7 @@ test("loader pins Bearer to chat and forwards the original 429", async () => {
   globalThis.fetch = async (_input, init) => {
     calls++
     expect(init.redirect).toBe("error")
-    expect(init.headers.get("user-agent")).toBe("magpie-mistral-vibe/0.2.0")
+    expect(init.headers.get("user-agent")).toBe("mistral-client-python/Mistral-Vibe/3.1.3")
     return new Response("limited", { status: 429, headers: { "retry-after": "0" } })
   }
   for (const url of ["http://other.local/v1/chat/completions", "http://mock.local/v1/models"]) {
